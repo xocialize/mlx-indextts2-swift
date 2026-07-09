@@ -274,7 +274,8 @@ XCTest MAT-1..5/manifest suites + the MLXEngineAudio `INDEXTTS2_VALIDATE=1` in-a
 ## Dependencies by phase
 
 - P1: none (pure Swift). P2+: mlx-swift (+ mlx-swift-lm attention helpers).
-- P3: the `mlx-audio-dsp` shared leaf — **BUILT 2026-07-08** (`mlxengine-audio/WIP/mlx-audio-dsp`,
+- P3: the `mlx-audio-dsp` shared leaf — **BUILT 2026-07-08** (`mlxengine-audio/PROD/mlx-audio-dsp`,
+  PROD-promoted 2026-07-09; consumed via remote tag v0.1.0,
   module `MLXAudioDSP`): hann (periodic/symmetric) + povey windows, reflect-pad, strided framing
   (center-STFT + kaldi snip-edges), DC-offset removal, per-frame pre-emphasis (kaldi x[−1]≡x[0]),
   power/magnitude spectra (with kaldi pad-to-512), mel-filterbank apply. Filterbank GENERATION is
