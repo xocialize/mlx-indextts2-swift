@@ -156,6 +156,84 @@ func gateP3Frontend() throws {
     print("P3-FRONTEND GATE PASSED")
 }
 
+// MARK: - P3b w2v-BERT Conformer gate
+
+func gateP3W2VBert() throws {
+    Device.setDefault(device: Device(.cpu))
+    let ladder = goldensDir.appending(path: "w2vbert")
+
+    let defaultW2V = home.appending(
+        path: ".cache/huggingface/hub/models--facebook--w2v-bert-2.0/snapshots/da985ba0987f70aaeb84a80f2851cfac8c697a7b")
+    let w2vDir = argValue("--w2v-weights").map { URL(fileURLWithPath: $0) } ?? defaultW2V
+
+    print("→ building Wav2Vec2BertModel + loading model.safetensors")
+    let model = Wav2Vec2BertModel()
+    let declared = Set(model.parameters().flattened().map(\.0))
+
+    let raw = try loadArrays(url: w2vDir.appending(path: "model.safetensors"))
+    let sanitized = Wav2Vec2BertModel.sanitize(raw).mapValues { $0.asType(.float32) }
+
+    let onDisk = Set(sanitized.keys)
+    let missing = declared.subtracting(onDisk)
+    let unused = onDisk.subtracting(declared)
+    guard missing.isEmpty else { fail("missing keys: \(missing.sorted().prefix(8)) …") }
+    guard unused.isEmpty else { fail("unused keys: \(unused.sorted().prefix(8)) …") }
+    print("  keys: \(sanitized.count) (declared \(declared.count)); contract 0-missing/0-unused OK")
+
+    try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: .all)
+    eval(model)
+
+    let mean = try NPY.load(ladder.appending(path: "semantic_mean.npy")).asType(.float32)
+    let std = try NPY.load(ladder.appending(path: "semantic_std.npy")).asType(.float32)
+    let golden = try NPY.load(goldensDir.appending(path: "frontend_ref__spk_cond_emb.npy")).asType(.float32)
+
+    // --- Ladder A: injected golden input_features (isolates the Conformer port) ---
+    print("→ ladder A: injected golden input_features")
+    let inputFeatures = try NPY.load(ladder.appending(path: "input_features.npy")).asType(.float32)
+    let attentionMask = try NPY.load(ladder.appending(path: "attention_mask.npy")).asType(.int32)
+    print("  input \(inputFeatures.shape)  mask sum \(attentionMask.sum().item(Int32.self))")
+
+    let start = Date()
+    let (_, hs) = model(inputFeatures: inputFeatures, attentionMask: attentionMask)
+    eval(hs)
+    print(String(format: "  forward %.2fs (%d hidden states)", Date().timeIntervalSince(start), hs.count))
+
+    var worst: (Float, Int) = (0, -1)
+    for i in 0 ..< hs.count {
+        let g = try NPY.load(ladder.appending(path: String(format: "hidden_states_%02d.npy", i)))
+        let mad = maxAbsDiff(hs[i], g)
+        if mad > worst.0 { worst = (mad, i) }
+        if mad > 1e-3 { fail(String(format: "hidden_states[%d] max_abs %.6f > 1e-3", i, mad)) }
+    }
+    print(String(format: "  25 hidden states ≤ 1e-3 ✓ (worst %.2e at hs[%d])", worst.0, worst.1))
+
+    let tapA = Wav2Vec2BertModel.semanticTap(hs, mean: mean, std: std)
+    let madA = maxAbsDiff(tapA, golden)
+    let cosA = cosine(tapA, golden)
+    print(String(format: "  normalized hs[17] vs spk_cond_emb golden: cos=%.7f max_abs=%.2e", cosA, madA))
+    guard madA < 1e-3 else { fail(String(format: "ladder-A tap max_abs %.6f > 1e-3", madA)) }
+
+    // --- Chain B: full Swift front-end (audio → SeamlessFeatureExtractor → Conformer) ---
+    print("→ chain B: full Swift chain from audio_16k")
+    var wav = try NPY.load(goldensDir.appending(path: "frontend/audio_16k.npy")).asType(.float32)
+    if wav.ndim == 2 { wav = wav[0] }
+    guard let (features, mask) = SeamlessFeatureExtractor.callAsFeatures(wav) else {
+        fail("feature extraction failed")
+    }
+    let (_, hsB) = model(inputFeatures: features, attentionMask: mask)
+    let tapB = Wav2Vec2BertModel.semanticTap(hsB, mean: mean, std: std)
+    eval(tapB)
+    guard tapB.shape == golden.shape else {
+        fail("chain-B shape \(tapB.shape) vs golden \(golden.shape)")
+    }
+    let cosB = cosine(tapB, golden)
+    let madB = maxAbsDiff(tapB, golden)
+    print(String(format: "  spk_cond_emb: cos=%.7f max_abs=%.5f", cosB, madB))
+    guard cosB >= 0.999 else { fail(String(format: "chain-B cos %.7f < 0.999", cosB)) }
+
+    print("P3B-W2VBERT GATE PASSED")
+}
+
 // MARK: - Entry
 
 let mode = CommandLine.arguments.dropFirst().first ?? "p2"
@@ -163,7 +241,8 @@ do {
     switch mode {
     case "p2": try gateP2()
     case "p3fe": try gateP3Frontend()
-    default: fail("unknown mode \(mode) (expected: p2 | p3fe)")
+    case "p3w2v": try gateP3W2VBert()
+    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v)")
     }
 } catch {
     fail("\(error)")
