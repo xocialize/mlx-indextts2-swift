@@ -41,6 +41,7 @@ let package = Package(
             dependencies: [
                 "MLXIndexTTS2",
                 .product(name: "MLXRandom", package: "mlx-swift"),
+                .product(name: "MLXAudioDSP", package: "mlx-audio-dsp"),
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

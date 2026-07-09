@@ -12,6 +12,7 @@
 
 import Foundation
 import MLX
+import MLXAudioDSP
 import MLXNN
 import MLXIndexTTS2
 
@@ -1009,6 +1010,260 @@ func gateP7AR() throws {
     print("P7-AR GATE PASSED")
 }
 
+/// |STFT|-magnitude cosine between two mono waveforms (n_fft 512, hop 128, hann).
+/// The perceptual-domain metric for vocoder outputs — raw waveform cosine is chaotic
+/// through BigVGAN's snake stacks (P6 calibration), |STFT| magnitude is not.
+func stftMagCosine(_ a: MLXArray, _ b: MLXArray) -> Float {
+    let window = AudioDSP.hannWindow(512, periodic: true)
+    func mag(_ x: MLXArray) -> MLXArray {
+        let padded = AudioDSP.reflectPadded(x.asType(.float32), pad: 256)
+        return AudioDSP.magnitudeSpectrum(
+            AudioDSP.framed(padded, frameLength: 512, hop: 128), window: window)
+    }
+    return cosine(mag(a), mag(b))
+}
+
+// MARK: - P7 gate: GPU smoke (full chain + AR loop on the GPU stream)
+
+// Watchdog rules honored: weight loads stay CPU-stream (Device.withDefaultDevice(.cpu),
+// eval(model) inside the loaders after the fp32 upcast); every forward runs on the GPU
+// default stream. Goldens are fp16-Metal captures; GPU-fp32 lands in the same ~1e-3
+// noise class as the CPU-fp32 gates, so the same cos thresholds apply (stages ≥0.999,
+// wav ≥0.97). Sampled/greedy AR sequences are validity/report-only on GPU (knife-edge
+// flips vs the CPU capture are expected, not defects).
+func gateP7GPU() throws {
+    print("→ device: GPU stream for forwards; loads pinned to CPU stream")
+
+    func mb(_ bytes: Int) -> String { String(format: "%.0f MB", Double(bytes) / 1_048_576) }
+    var stageCos: [(String, Float)] = []
+    func report(_ name: String, _ ours: MLXArray, _ goldenFile: String) throws {
+        let g = try NPY.load(goldensDir.appending(path: goldenFile)).asType(.float32)
+        guard ours.shape == g.shape else { fail("\(name): shape \(ours.shape) vs \(g.shape)") }
+        let cos = cosine(ours, g)
+        stageCos.append((name, cos))
+        print(String(format: "  %@ cos=%.7f",
+                     name.padding(toLength: 18, withPad: " ", startingAt: 0), cos))
+    }
+    func timed<T>(_ name: String, _ body: () throws -> T) rethrows -> T {
+        let start = Date()
+        let result = try body()
+        print(String(format: "  [%@ %.2fs]", name, Date().timeIntervalSince(start)))
+        return result
+    }
+
+    // --- Loads (CPU stream) ---
+    let loadStart = Date()
+    let (gpt, s2mel, bigvgan, vq2emb, w2v, repcodec, campplus) =
+        try Device.withDefaultDevice(Device(.cpu)) {
+            () -> (UnifiedVoiceV2, S2Mel, BigVGANV2, Vq2Emb, Wav2Vec2BertModel, RepCodec, CAMPPlus) in
+            let gpt = try loadUnifiedVoiceV2()
+            let s2mel = try loadS2Mel()
+            let bigvgan = try loadBigVGAN()
+            let vq2emb = Vq2Emb()
+            let raw = try loadArrays(url: weightsDir.appending(path: "vq2emb.safetensors"))
+            try vq2emb.update(
+                parameters: ModuleParameters.unflattened(
+                    Vq2Emb.sanitize(raw).mapValues { $0.asType(.float32) }),
+                verify: .all)
+            eval(vq2emb)
+
+            let w2v = Wav2Vec2BertModel()
+            let w2vDir = home.appending(
+                path: ".cache/huggingface/hub/models--facebook--w2v-bert-2.0/snapshots/da985ba0987f70aaeb84a80f2851cfac8c697a7b")
+            let w2vRaw = try loadArrays(url: w2vDir.appending(path: "model.safetensors"))
+            try w2v.update(
+                parameters: ModuleParameters.unflattened(
+                    Wav2Vec2BertModel.sanitize(w2vRaw).mapValues { $0.asType(.float32) }),
+                verify: .all)
+            eval(w2v)
+
+            let repcodec = RepCodec()
+            let mgcDir = home.appending(
+                path: ".cache/huggingface/hub/models--amphion--MaskGCT/snapshots/265c6cef07625665d0c28d2faafb1415562379dc/semantic_codec")
+            let mgcRaw = try loadArrays(url: mgcDir.appending(path: "model.safetensors"))
+            try repcodec.update(
+                parameters: ModuleParameters.unflattened(
+                    RepCodec.sanitize(mgcRaw).mapValues { $0.asType(.float32) }),
+                verify: .all)
+            eval(repcodec)
+
+            let campplus = CAMPPlus()
+            campplus.train(false)
+            let cppRaw = try loadArrays(
+                url: home.appending(path: "Development/_indextts2-oracle/campplus_cn_common.safetensors"))
+            try campplus.update(
+                parameters: ModuleParameters.unflattened(
+                    CAMPPlus.sanitize(cppRaw).mapValues { $0.asType(.float32) }),
+                verify: .all)
+            eval(campplus)
+            return (gpt, s2mel, bigvgan, vq2emb, w2v, repcodec, campplus)
+        }
+    print(String(format: "  loads (CPU stream): %.1fs  resident=%@",
+                 Date().timeIntervalSince(loadStart), mb(Memory.activeMemory)))
+    let residentAfterLoad = Memory.activeMemory
+    Memory.peakMemory = 0  // isolate forward-pass activation peak from load transients
+
+    // --- Front-end (GPU) ---
+    print("→ [1/5] reference conditioning (GPU)")
+    var wav16k = try NPY.load(goldensDir.appending(path: "frontend/audio_16k.npy")).asType(.float32)
+    if wav16k.ndim == 2 { wav16k = wav16k[0] }
+
+    let spkCondEmb = try timed("w2v-BERT") { () -> MLXArray in
+        guard let (features, mask) = SeamlessFeatureExtractor.callAsFeatures(wav16k) else {
+            fail("feature extraction failed")
+        }
+        let (_, hs) = w2v(inputFeatures: features, attentionMask: mask)
+        let mean = try NPY.load(goldensDir.appending(path: "w2vbert/semantic_mean.npy")).asType(.float32)
+        let std = try NPY.load(goldensDir.appending(path: "w2vbert/semantic_std.npy")).asType(.float32)
+        let tap = Wav2Vec2BertModel.semanticTap(hs, mean: mean, std: std)
+        eval(tap)
+        return tap
+    }
+    try report("spk_cond_emb", spkCondEmb, "frontend_ref__spk_cond_emb.npy")
+
+    let sRef = timed("RepCodec") { () -> MLXArray in
+        let (_, s) = repcodec.quantize(spkCondEmb)
+        eval(s)
+        return s
+    }
+    try report("S_ref", sRef, "frontend_ref__S_ref.npy")
+
+    let style = timed("CampPlus") { () -> MLXArray in
+        guard let cmn = CampPlusFbank.fbankCMN(wav16k) else { fail("campplus fbank failed") }
+        let s = campplus(cmn[.newAxis, 0..., 0...])
+        eval(s)
+        return s
+    }
+    try report("style", style, "frontend_ref__style.npy")
+
+    // --- GPT conditioning (GPU) ---
+    print("→ [2/5] GPT conditioning (GPU)")
+    let conditioning = try timed("conditioning") { () -> MLXArray in
+        let spkNCL = spkCondEmb.transposed(0, 2, 1)
+        let speechCond = gpt.getConditioning(spkNCL)
+        let baseEmovec = gpt.getEmovec(spkNCL)
+        let emovecMat = try NPY.load(goldensDir.appending(path: "frontend_emovec_mat.npy")).asType(.float32)
+        let emoVec = emovecMat + 0.4 * baseEmovec
+        let c = gpt.prepareConditioningLatents(
+            speechConditioning: speechCond, emoVec: emoVec, batchSize: 1)
+        eval(c)
+        return c
+    }
+    try report("conditioning", conditioning, "core_gpt_conditioning.npy")
+
+    // --- AR loop (GPU): greedy report + seeded sampled validity ---
+    print("→ [3/5] AR loop (GPU)")
+    let textTokens = try NPY.load(goldensDir.appending(path: "core_gpt_latent__in0.npy"))
+
+    let greedy = timed("greedy AR") {
+        gpt.generateMelCodes(
+            conditioning: conditioning, textTokens: textTokens, maxMelTokens: 300,
+            temperature: 0, topK: 30, topP: 0.8, repetitionPenalty: 10.0)
+    }
+    let goldenTokensArr = try NPY.load(goldensDir.appending(path: "ar/ar_greedy_tokens.npy")).asType(.int32)
+    eval(goldenTokensArr)
+    let goldenTokens = (0 ..< goldenTokensArr.dim(0)).map { Int(goldenTokensArr[$0].item(Int32.self)) }
+    let nCmp = min(greedy.melCodes.count, goldenTokens.count)
+    let prefix = (0 ..< nCmp).first { greedy.melCodes[$0] != goldenTokens[$0] } ?? nCmp
+    print("  greedy: \(greedy.melCodes.count) tokens, stopped=\(greedy.stopped), "
+          + "matches CPU capture through step \(prefix)/\(goldenTokens.count) (report-only)")
+    guard greedy.stopped else { fail("GPU greedy run did not emit stop token") }
+
+    MLXRandom.seed(42)
+    let sampled = timed("sampled AR") {
+        gpt.generateMelCodes(
+            conditioning: conditioning, textTokens: textTokens, maxMelTokens: 600,
+            temperature: 0.8, topK: 30, topP: 0.8, repetitionPenalty: 10.0)
+    }
+    print("  sampled(seed 42): \(sampled.melCodes.count) raw tokens, stopped=\(sampled.stopped)")
+    guard sampled.stopped, (20 ... 600).contains(sampled.melCodes.count) else {
+        fail("GPU sampled run invalid (stopped=\(sampled.stopped), n=\(sampled.melCodes.count))")
+    }
+
+    // --- Teacher-forced latent + S2Mel + vocoder (GPU), golden-comparable ---
+    print("→ [4/5] teacher-forced latent + S2Mel + BigVGAN (GPU)")
+    let melCodes = try NPY.load(goldensDir.appending(path: "core_gpt_latent__in1.npy"))
+    let gptLatent = timed("forwardLatent") { () -> MLXArray in
+        let l = gpt.forwardLatent(
+            conditioning: conditioning, textTokens: textTokens, melCodes: melCodes)
+        eval(l)
+        return l
+    }
+    try report("gpt_latent", gptLatent, "core_gpt_latent.npy")
+
+    let refMel = try NPY.load(goldensDir.appending(path: "frontend_ref__ref_mel.npy")).asType(.float32)
+    let mel = try timed("S2Mel+CFM") { () -> MLXArray in
+        let promptCondition = s2mel.lengthRegulatorModule(
+            sRef, ylens: MLXArray([Int32(refMel.dim(2))]))
+        let gptlayerOut = s2mel.gptLayerModule(gptLatent)
+        let sInfer = vq2emb(melCodes).transposed(0, 2, 1) + gptlayerOut
+        let codeLen = melCodes.dim(1)
+        let cond = s2mel.lengthRegulatorModule(
+            sInfer, ylens: MLXArray([Int32(Float(codeLen) * 1.72)]))
+        let catCondition = concatenated([promptCondition, cond], axis: 1)
+        let zGolden = try NPY.load(goldensDir.appending(path: "core_s2mel_cfm_z_seed42.npy")).asType(.float32)
+        let m = s2mel.cfmModule.inference(
+            mu: catCondition, xLens: MLXArray([Int32(catCondition.dim(1))]),
+            prompt: refMel, style: style,
+            nTimesteps: 25, temperature: 1.0, inferenceCfgRate: 0.7, injectedZ: zGolden)
+        eval(m)
+        return m
+    }
+    try report("cfm_mel", mel, "core_s2mel_cfm_mel_seed42.npy")
+
+    let wav = timed("BigVGAN") { () -> MLXArray in
+        let w = bigvgan(mel[0..., 0..., refMel.dim(2)...])
+        eval(w)
+        return w
+    }
+    try report("bigvgan_wav", wav, "core_bigvgan_wav_seed42.npy")
+
+    // Pure-vocode diagnostic: golden mel in → GPU vocoder. Isolates the vocoder's own
+    // GPU-fp32-vs-Metal-fp16 backend noise from upstream mel drift (report-only).
+    let goldenMel = try NPY.load(goldensDir.appending(path: "core_s2mel_cfm_mel_seed42.npy")).asType(.float32)
+    let pureVocode = bigvgan(goldenMel[0..., 0..., refMel.dim(2)...])
+    eval(pureVocode)
+    let goldenWav = try NPY.load(goldensDir.appending(path: "core_bigvgan_wav_seed42.npy")).asType(.float32)
+    print(String(format: "  pure-vocode(golden mel): raw cos=%.7f  |STFT| cos=%.7f (report-only)",
+                 cosine(pureVocode, goldenWav),
+                 stftMagCosine(pureVocode[0, 0], goldenWav[0, 0])))
+
+    let stftCos = stftMagCosine(wav[0, 0], goldenWav[0, 0])
+    print(String(format: "  bigvgan_wav |STFT| cos=%.7f", stftCos))
+
+    // --- Metrics + memory ---
+    print("→ [5/5] audio metrics + memory")
+    var audio = wav[0, 0]
+    let peak = MLX.abs(audio).max().item(Float.self)
+    if peak > 1.0 { audio = audio / max(peak, 1e-6) }
+    audio = clip(audio, min: -0.99, max: 0.99)
+    eval(audio)
+    let rms = sqrt(mean(audio * audio)).item(Float.self)
+    let dbfs = 20 * log10(max(rms, 1e-12))
+    print(String(format: "  RMS=%.4f  dBFS=%.1f", rms, dbfs))
+    print("  resident(after load)=\(mb(residentAfterLoad))  "
+          + "peak(forwards)=\(mb(Memory.peakMemory))  "
+          + "active=\(mb(Memory.activeMemory))  cache=\(mb(Memory.cacheMemory))")
+
+    print("\n  per-stage summary (GPU-fp32 vs fp16-Metal goldens):")
+    for (name, cos) in stageCos {
+        print(String(format: "    %@ %.7f", name.padding(toLength: 18, withPad: " ", startingAt: 0), cos))
+    }
+    for (name, cos) in stageCos where name != "bigvgan_wav" {
+        guard cos >= 0.999 else { fail(String(format: "stage %@ cos %.7f < 0.999", name, cos)) }
+    }
+    // Waveform gate = spectral, per the P6 chaos calibration (GPU-fp32 backend noise through
+    // the snake stacks drops RAW wav cos to ~0.95 while |STFT| stays ~1); raw cos keeps only
+    // a structural-break floor (real breaks read ~0.05–0.5, e.g. the P5 aliasing bug).
+    guard stftCos >= 0.999 else { fail(String(format: "bigvgan_wav |STFT| cos %.7f < 0.999", stftCos)) }
+    guard stageCos.last!.1 >= 0.90 else {
+        fail(String(format: "bigvgan_wav raw cos %.7f < 0.90 (structural floor)", stageCos.last!.1))
+    }
+    guard dbfs > -35 && dbfs < -10 else { fail(String(format: "dBFS %.1f outside (−35, −10)", dbfs)) }
+
+    print("P7-GPU GATE PASSED")
+}
+
 // MARK: - Entry
 
 let mode = CommandLine.arguments.dropFirst().first ?? "p2"
@@ -1024,7 +1279,8 @@ do {
     case "p5": try gateP5()
     case "p6": try gateP6()
     case "p7ar": try gateP7AR()
-    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc | p3cpp | p3cond | p4 | p5 | p6 | p7ar)")
+    case "p7gpu": try gateP7GPU()
+    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc | p3cpp | p3cond | p4 | p5 | p6 | p7ar | p7gpu)")
     }
 } catch {
     fail("\(error)")
