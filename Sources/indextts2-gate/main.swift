@@ -234,6 +234,98 @@ func gateP3W2VBert() throws {
     print("P3B-W2VBERT GATE PASSED")
 }
 
+// MARK: - P3b MaskGCT RepCodec gate
+
+func gateP3MaskGCT() throws {
+    Device.setDefault(device: Device(.cpu))
+    let ladder = goldensDir.appending(path: "maskgct")
+
+    let defaultMGC = home.appending(
+        path: ".cache/huggingface/hub/models--amphion--MaskGCT/snapshots/265c6cef07625665d0c28d2faafb1415562379dc/semantic_codec")
+    let mgcDir = argValue("--maskgct-weights").map { URL(fileURLWithPath: $0) } ?? defaultMGC
+
+    print("→ building RepCodec + loading semantic_codec/model.safetensors")
+    let model = RepCodec()
+    let declared = Set(model.parameters().flattened().map(\.0))
+
+    let raw = try loadArrays(url: mgcDir.appending(path: "model.safetensors"))
+    let sanitized = RepCodec.sanitize(raw).mapValues { $0.asType(.float32) }
+
+    let missing = declared.subtracting(sanitized.keys)
+    let unused = Set(sanitized.keys).subtracting(declared)
+    guard missing.isEmpty else { fail("missing keys: \(missing.sorted().prefix(8)) …") }
+    guard unused.isEmpty else { fail("unused keys: \(unused.sorted().prefix(8)) …") }
+    print("  keys: \(sanitized.count) (declared \(declared.count)); contract 0-missing/0-unused OK")
+
+    try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: .all)
+    eval(model)
+
+    let x = try NPY.load(goldensDir.appending(path: "frontend_ref__spk_cond_emb.npy")).asType(.float32)
+    let sRefGolden = try NPY.load(goldensDir.appending(path: "frontend_ref__S_ref.npy")).asType(.float32)
+
+    // Some ladder goldens were captured channels-first (B,C,T); transpose to our (B,T,C).
+    func check(_ name: String, _ ours: MLXArray, _ file: String, thr: Float = 1e-3) throws {
+        var g = try NPY.load(ladder.appending(path: file)).asType(.float32)
+        if ours.shape != g.shape && g.ndim == 3 && ours.ndim == 3
+            && g.shape == [ours.dim(0), ours.dim(2), ours.dim(1)] {
+            g = g.transposed(0, 2, 1)
+        }
+        guard ours.shape == g.shape else { fail("\(name): shape \(ours.shape) vs golden \(g.shape)") }
+        let mad = maxAbsDiff(ours, g)
+        print(String(format: "  %@ max_abs = %.3e", name.padding(toLength: 20, withPad: " ", startingAt: 0), mad))
+        if mad >= thr { fail(String(format: "%@ max_abs %.3e ≥ %.0e", name, mad, thr)) }
+    }
+
+    print("→ encoder ladder")
+    let vb = model.encoderBackboneModule
+    let ex = vb.embedLayer(x)
+    try check("enc_vb_embed", ex, "enc_vb_embed.npy")
+    var cx = vb.normLayer(ex)
+    try check("enc_vb_norm", cx, "enc_vb_norm.npy")
+    for (i, block) in vb.convnextBlocks.enumerated() {
+        cx = block(cx)
+        if [0, 5, 11].contains(i) {
+            try check("enc_vb_convnext_\(i)", cx, "enc_vb_convnext_\(i).npy")
+        }
+    }
+    let fx = vb.finalLayerNormLayer(cx)
+    try check("enc_vb_final", fx, "enc_vb_final.npy")
+    let z = model.encoderProjLayer(fx)
+    try check("enc_out_z", z, "enc_out_z.npy")
+
+    print("→ quantizer ladder")
+    let fvq = model.quantizerModule.firstQuantizer
+    let zE = fvq.inProject(z)
+    try check("fvq_z_e", zE, "fvq_z_e.npy")
+    let (zQ, indices) = fvq.decodeLatents(zE)
+    try check("fvq_zq_prelatent", zQ, "fvq_zq_prelatent.npy")
+    let ladIdx = try NPY.load(ladder.appending(path: "fvq_indices.npy"))
+        .asType(.int32).reshaped(indices.shape)
+    let idxMatches = (indices.asType(.int32) .== ladIdx).sum().item(Int32.self)
+    let idxTotal = Int32(indices.size)
+    print("  fvq_indices \(idxMatches)/\(idxTotal) exact")
+    guard idxMatches == idxTotal else { fail("fvq_indices only \(idxMatches)/\(idxTotal) match") }
+    try check("fvq_zq_out", fvq.outProject(zQ), "fvq_zq_out.npy")
+
+    print("→ final gate: quantize() vs pipeline golden")
+    let (codes, sRef) = model.quantize(x)
+    eval(codes, sRef)
+    let goldCodes = try NPY.load(ladder.appending(path: "codes.npy"))
+        .asType(.int32).reshaped(codes.shape)
+    let codeMatches = (codes.asType(.int32) .== goldCodes).sum().item(Int32.self)
+    let codeTotal = Int32(codes.size)
+    let lo = codes.min().item(Int32.self), hi = codes.max().item(Int32.self)
+    print("  codes \(codeMatches)/\(codeTotal) exact (range \(lo)..\(hi))")
+    guard codeMatches == codeTotal else { fail("codes only \(codeMatches)/\(codeTotal) match") }
+
+    let madFinal = maxAbsDiff(sRef, sRefGolden)
+    let cosFinal = cosine(sRef, sRefGolden)
+    print(String(format: "  S_ref vs golden: cos=%.7f max_abs=%.3e", cosFinal, madFinal))
+    guard madFinal < 1e-3 else { fail(String(format: "S_ref max_abs %.3e ≥ 1e-3", madFinal)) }
+
+    print("P3B-MASKGCT GATE PASSED")
+}
+
 // MARK: - Entry
 
 let mode = CommandLine.arguments.dropFirst().first ?? "p2"
@@ -242,7 +334,8 @@ do {
     case "p2": try gateP2()
     case "p3fe": try gateP3Frontend()
     case "p3w2v": try gateP3W2VBert()
-    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v)")
+    case "p3mgc": try gateP3MaskGCT()
+    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc)")
     }
 } catch {
     fail("\(error)")
