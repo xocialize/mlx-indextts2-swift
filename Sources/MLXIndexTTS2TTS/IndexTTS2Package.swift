@@ -33,15 +33,16 @@ import MLXToolKit
 public final class IndexTTS2Package: ModelPackage {
     public typealias Configuration = IndexTTS2Configuration
 
-    /// Provisional split footprints (P7 measurement lane + production-dtype arithmetic);
-    /// re-baselined against in-app phys_footprint by the MLXEngineAudio harness run.
-    /// Residents: fp16 chain ≈ GPT 1.65 + S2Mel 0.20 + BigVGAN 0.21 + w2v-BERT 2.2 (fp32)
-    /// + codec 0.17 + CampPlus 0.03 GB; int8/int4 shave the GPT backbone Linears.
-    /// Activation peak is CFM/BigVGAN-dominated — quant tiers move residents, NOT the peak.
+    /// Split footprints, in-app phys_footprint baseline (MLXEngineAudio INDEXTTS2_VALIDATE
+    /// run, 2026-07-09): post-load floor 4.76 GB (fp16 chain: GPT 1.65 + S2Mel 0.20 +
+    /// BigVGAN 0.21 + w2v-BERT 2.2 fp32 + codec 0.17 + CampPlus 0.03 GB + process overhead);
+    /// run-phase peak 9.61 GB (~4.6 s utterance, emotion path) ⇒ transient ≈ 4.85 GB —
+    /// CFM/BigVGAN-dominated, so quant tiers move residents, NOT the peak. int8/int4 deltas
+    /// from the P7 quant lane (GPT backbone Linears only). Post-evict phys returns to 0.37 GB.
     nonisolated static let fp16ResidentBytes: UInt64 = 5_000_000_000
     nonisolated static let int8ResidentBytes: UInt64 = 4_350_000_000
     nonisolated static let int4ResidentBytes: UInt64 = 4_100_000_000
-    nonisolated static let peakActivationBytes: UInt64 = 3_500_000_000
+    nonisolated static let peakActivationBytes: UInt64 = 5_000_000_000
 
     public nonisolated static var manifest: PackageManifest {
         PackageManifest(

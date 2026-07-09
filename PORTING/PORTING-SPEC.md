@@ -17,6 +17,7 @@ Stage-0 goldens (`_indextts2-oracle/goldens/`, 23 files + manifest; seed=42 tupl
 | P5 | BigVGAN2 vocoder | `bigvgan_wav` golden + listen | **PASSED 2026-07-08** (`p5`: wav(seed42) cos 0.9995050 / wav(orig) cos 0.9995069 — equals the Python reference's own CPU-vs-Metal floor (0.9995355); 449-key contract; all anti-alias primitive probes ≤7.4e-3) |
 | P6 | e2e | Stage-0 WAV, quantified (dBFS/RMS, not ears) | **PASSED 2026-07-08** (`p6`: 12 native stages, all ≥0.9999970; e2e audio RMS 0.0711/−23.0 dBFS vs golden 0.0695/−23.2; wav cos 0.9786 = inside BigVGAN's inherent chaos band (python itself: 0.9945 @9e-4 mel perturb); \|STFT\| cos 0.9998; WAV at PORTING/p6_e2e_seed42.wav) |
 | P7 | AR sampling + GPU smoke + quant | (a) greedy token-exact + step-0 logits ≥0.9999 vs fp32-CPU oracle capture; (b) full chain on GPU stream, stages ≥0.999 + \|STFT\| ≥0.999; (c) int8/int4 gpt_latent ≥0.9999/≥0.99 + e2e validity (forwards GPU-only) | **PASSED 2026-07-09** (`p7ar`: greedy 114/114 EXACT, step-0 logits cos 0.9999999, sampled(42) 111 tokens → −23.3 dBFS; `p7gpu`: all stages ≥0.9995, GPU greedy 114/114, \|STFT\| 0.9997976, pure-vocode raw 0.9999903; `p7quant`: int8 0.9999846 / int4 0.9952125, both e2e valid) |
+| Stage 2 | engine wrap (contract + runtime + harness) | ref-mel/emovec debts vs goldens; MAT-1..5 + manifest offline; self-contained production run; MLXServeEngine in-app: license gate + prepare/run timed + footprints + listen WAVs | **COMPLETE 2026-07-09** (`stage2` refmel cos 0.9999999/emovec bitwise; `stage2e2e` fp16 4475 MB, targetDuration 3.00 s EXACT; in-app: NC gate fires, materialization ~6.6 GB → prepare 321 s, runs 20.8/7.4/6.2 s, phys floor 4.76 / peak 9.61 GB, post-evict 0.37 GB) |
 
 ## P1 notes (banked)
 
@@ -231,6 +232,44 @@ quantization moves residents, not the peak. Buffer-pool cache grew to ~16 GB ove
 full-chain run (engine ≥0.21.0 owns the cacheLimit at Stage 2; gates clearCache()
 between passes). fp16-resident + envelope-sized activation numbers for the manifest's
 `QuantFootprint` come from the Stage-2 MemoryProbe pass at production dtypes.
+
+## Stage 2 — engine integration (COMPLETE 2026-07-09)
+
+**All Stage-2 debts closed; package live-validated through MLXServeEngine.** Gates:
+`indextts2-gate stage2` (front-end debts) + `stage2e2e` (self-contained production runtime) +
+XCTest MAT-1..5/manifest suites + the MLXEngineAudio `INDEXTTS2_VALIDATE=1` in-app run.
+
+- **Injected-golden debts closed:** (1) 22.05 kHz ref-mel head (`Frontend/RefMel.swift` on
+  MLXAudioDSP; oracle recompute bitwise vs `frontend_ref__ref_mel`, Swift cos 0.9999999 /
+  max_abs 4.2e-5); (2) preset-emotion path (`Frontend/EmotionPresets.swift`; feat1/feat2
+  matrices baked, emovec_mat bitwise vs golden, per-category cosine speaker match verified).
+  Dump tool: `_indextts2-oracle/tools/dump_stage2.py` → `goldens/stage2/` (+ archived in
+  `PORTING/goldens-stage2/`).
+- **Contract:** `MLXIndexTTS2TTS` wrapper target — `IndexTTS2Configuration` (ModelStorable +
+  QuantConfigured fp16|int8|int4 + BudgetAware + WeightSourcing: main/vanch007 4-safetensors
+  glob, w2v-bert, semantic-codec — quant-invariant, tiers quantize in-memory at load) +
+  `IndexTTS2Package` (C7 `LicenseRef-Index-Model` NonCommercial `.permissiveOrAcknowledged` /
+  C8 Apache; `emotionControl`+`durationControl` specialties; tier-3 provenance pinned).
+  Engine-side additions (mlx-engine-swift, local commit): the license entry + the two
+  specialty terms. Checkpoint pickles Swift can't read (feat1/feat2, wav2vec2bert_stats,
+  campplus .bin→safetensors, tokenizer vocab) are BAKED package resources — move to the
+  weight repo at the own-conversion re-publish.
+- **Runtime:** core `IndexTTS2Generator` (engine-free generate_v2 driver; as-shipped dtypes —
+  fp16 main/fp32 front-end, the reference's own production dtypes; CPU-stream loads,
+  GPU forwards; per-segment clearCache). E12 metaData plane on `run(_:)`: `emotion`
+  (name/weighted-list/8-vector), `emoAlpha`, `targetDuration` (native lenreg fit),
+  `speechRate`, `seed` (32-bit clamp). Reference-prep memoized per clip (Qwen3 E1 pattern).
+- **In-app validation (MLXEngineAudio, engine-driven):** `.permissiveOnly` REJECTS naming
+  the weight layer; acknowledged engine admits. First-run auto-materialization downloaded all
+  3 sources into the container store (prepare 321.3 s incl. ~6.6 GB download). Runs:
+  clone-neutral 20.8 s cold → 4.19 s @ −26.0 dBFS · emotion-happy 7.4 s → 4.64 s @ −16.1 dBFS
+  (the lever audibly hotter) · duration-3s 6.2 s → **3.00 s EXACT** @ −26.8 dBFS. Memory:
+  engine-charged 5.00 GB = declared; phys floor 4.76 GB, run peak 9.61 GB ⇒ transient
+  ≈4.85 GB (manifest declares 5.0 GB); post-evict phys 0.37 GB (clean reclaim).
+- **Remaining (needs authorization, out of Stage 2):** publish xocialize/mlx-indextts2-swift +
+  mlx-audio-dsp repos (then whisper-mlx-swift URL dep + tag), weight re-publish
+  (+ campplus/emo-matrices safetensors, fp16 w2v-BERT ≈ −1.1 GB), restore the app's remote
+  engine ref + package engine pin once ≥0.23.0 is tagged, E12 C5 promotion on 2nd adopter.
 
 ## Dependencies by phase
 
