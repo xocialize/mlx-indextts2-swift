@@ -13,8 +13,7 @@ import PackageDescription
 //
 // Stage 2: `MLXIndexTTS2TTS` is the engine-facing wrapper (IndexTTS2Configuration +
 // IndexTTS2Package) over the `MLXIndexTTS2` core — same split as MLXVoxCPM2TTS/MLXQwen3TTS.
-// The core stays MLXToolKit-free. Engine contract is a local-path dep during WIP
-// (pin a tagged mlx-engine-swift ≥0.23.0 — the LicenseRef-Index-Model entry — at publish).
+// The core stays MLXToolKit-free. Engine contract pinned ≥0.23.0 (LicenseRef-Index-Model).
 let package = Package(
     name: "mlx-indextts2-swift",
     platforms: [
@@ -27,11 +26,10 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
-        // Shared STFT/mel primitives (local path during WIP; publish before tagging).
-        .package(path: "../mlx-audio-dsp"),
-        // Engine contract (local path during WIP — needs the unreleased LicenseRef-Index-Model
-        // + emotionControl/durationControl specialty entries).
-        .package(path: "../../../MLXEngine/mlx-engine-swift"),
+        // Shared STFT/mel primitives.
+        .package(url: "https://github.com/xocialize/mlx-audio-dsp.git", from: "0.1.0"),
+        // Engine contract (≥0.23.0 = LicenseRef-Index-Model + emotionControl/durationControl).
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.23.0"),
         // Native downloader for WeightSourcing auto-materialization.
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
     ],
