@@ -326,6 +326,79 @@ func gateP3MaskGCT() throws {
     print("P3B-MASKGCT GATE PASSED")
 }
 
+// MARK: - P3b CampPlus gate
+
+func gateP3CampPlus() throws {
+    Device.setDefault(device: Device(.cpu))
+    let ladder = goldensDir.appending(path: "campplus")
+
+    let defaultCPP = home.appending(path: "Development/_indextts2-oracle/campplus_cn_common.safetensors")
+    let cppFile = argValue("--campplus-weights").map { URL(fileURLWithPath: $0) } ?? defaultCPP
+
+    print("→ building CAMPPlus(80, 192) + loading campplus_cn_common.safetensors")
+    let model = CAMPPlus()
+    model.train(false)  // BatchNorms must use running stats
+    let declared = Set(model.parameters().flattened().map(\.0))
+
+    let raw = try loadArrays(url: cppFile)
+    let sanitized = CAMPPlus.sanitize(raw).mapValues { $0.asType(.float32) }
+
+    let missing = declared.subtracting(sanitized.keys)
+    let unused = Set(sanitized.keys).subtracting(declared)
+    guard missing.isEmpty else { fail("missing keys: \(missing.sorted().prefix(8)) …") }
+    guard unused.isEmpty else { fail("unused keys: \(unused.sorted().prefix(8)) …") }
+    print("  keys: \(sanitized.count) (declared \(declared.count)); contract 0-missing/0-unused OK")
+
+    try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: .all)
+    eval(model)
+
+    func check(_ name: String, _ ours: MLXArray, thr: Float = 1e-3) throws {
+        var g = try NPY.load(ladder.appending(path: "\(name).npy")).asType(.float32)
+        if ours.shape != g.shape && g.ndim == 3 && ours.ndim == 3
+            && g.shape == [ours.dim(0), ours.dim(2), ours.dim(1)] {
+            g = g.transposed(0, 2, 1)
+        }
+        guard ours.shape == g.shape else { fail("\(name): shape \(ours.shape) vs golden \(g.shape)") }
+        let mad = maxAbsDiff(ours, g)
+        print(String(format: "  %@ max_abs = %.3e", name.padding(toLength: 20, withPad: " ", startingAt: 0), mad))
+        if mad >= thr { fail(String(format: "%@ max_abs %.3e ≥ %.0e", name, mad, thr)) }
+    }
+
+    print("→ ladder (input = campplus_fbank_cmn golden)")
+    let feat = try NPY.load(goldensDir.appending(path: "frontend/campplus_fbank_cmn.npy")).asType(.float32)
+    var h = feat[.newAxis, 0..., 0...]  // (1, T, 80)
+    h = model.headModule(h)
+    try check("head_out", h)
+    for (name, stage) in model.xvectorModule.stages {
+        h = stage(h)
+        try check(name, h)
+    }
+
+    print("→ final gate: style vs pipeline golden")
+    let golden = try NPY.load(goldensDir.appending(path: "frontend_ref__style.npy")).asType(.float32)
+    let style = model(feat[.newAxis, 0..., 0...])
+    eval(style)
+    guard style.shape == golden.shape else { fail("style shape \(style.shape) vs \(golden.shape)") }
+    let cos = cosine(style, golden)
+    let mad = maxAbsDiff(style, golden)
+    print(String(format: "  style: cos=%.7f max_abs=%.3e", cos, mad))
+    guard mad < 1e-3 else { fail(String(format: "style max_abs %.3e ≥ 1e-3", mad)) }
+
+    // Full Swift chain: audio → CampPlusFbank.fbankCMN → CAMPPlus.
+    print("→ chain: full Swift front-end from audio_16k")
+    var wav = try NPY.load(goldensDir.appending(path: "frontend/audio_16k.npy")).asType(.float32)
+    if wav.ndim == 2 { wav = wav[0] }
+    guard let cmn = CampPlusFbank.fbankCMN(wav) else { fail("fbank failed") }
+    let styleChain = model(cmn[.newAxis, 0..., 0...])
+    eval(styleChain)
+    let cosChain = cosine(styleChain, golden)
+    let madChain = maxAbsDiff(styleChain, golden)
+    print(String(format: "  style (chain): cos=%.7f max_abs=%.5f", cosChain, madChain))
+    guard cosChain >= 0.999 else { fail(String(format: "chain cos %.7f < 0.999", cosChain)) }
+
+    print("P3B-CAMPPLUS GATE PASSED")
+}
+
 // MARK: - Entry
 
 let mode = CommandLine.arguments.dropFirst().first ?? "p2"
@@ -335,7 +408,8 @@ do {
     case "p3fe": try gateP3Frontend()
     case "p3w2v": try gateP3W2VBert()
     case "p3mgc": try gateP3MaskGCT()
-    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc)")
+    case "p3cpp": try gateP3CampPlus()
+    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc | p3cpp)")
     }
 } catch {
     fail("\(error)")
