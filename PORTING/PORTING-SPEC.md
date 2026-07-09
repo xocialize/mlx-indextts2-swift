@@ -14,7 +14,7 @@ Stage-0 goldens (`_indextts2-oracle/goldens/`, 23 files + manifest; seed=42 tupl
 | P3a | fbank heads (Seamless w2v-BERT FE + CampPlus kaldi) on `mlx-audio-dsp` | vs HF `SeamlessM4TFeatureExtractor` / `torchaudio.compliance.kaldi.fbank` goldens (ref + synth) | **PASSED 2026-07-08** (`p3fe`: fbank cos 1.0000000, input_features 0.9999999 max_abs 1.2e-4, mask 249 exact) |
 | P3b | conditioner models: w2v-BERT Conformer + MaskGCT + CampPlus + conformer/perceivers | per-embed goldens (`spk_cond_emb`, `S_ref`, `style`, `emovec`) | **PASSED 2026-07-08** (`p3w2v` hs-ladder ≤1.93e-04, tap 1.85e-05, FE-chain cos 1.0; `p3mgc` codes 250/250 exact, S_ref 9.5e-07; `p3cpp` ladder ≤4.6e-05, style 5.0e-06; `p3cond` speech_cond/base_emovec/conditioning cos ≥0.999999) |
 | P4 | S2Mel CFM + length regulator | `cfm_mel` golden (seed-42 replay set) | **PASSED 2026-07-08** (`p4`: gptlayer cos 1.0000002, lenreg max_abs 0.0 BITWISE, dit_step1 cos 1.0000005, cfm_mel cos 0.9999999 over 25 steps; 264-key contract 0-missing/0-unused; seeded-normal cross-binding max_abs 4.8e-7) |
-| P5 | BigVGAN2 vocoder | `bigvgan_wav` golden + listen | — |
+| P5 | BigVGAN2 vocoder | `bigvgan_wav` golden + listen | **PASSED 2026-07-08** (`p5`: wav(seed42) cos 0.9995050 / wav(orig) cos 0.9995069 — equals the Python reference's own CPU-vs-Metal floor (0.9995355); 449-key contract; all anti-alias primitive probes ≤7.4e-3) |
 | P6 | e2e | Stage-0 WAV, quantified (dBFS/RMS, not ears) | — |
 | P7 | GPU smoke + int8 quant | GPU-stream forward (never CPU-pin quant!) | — |
 
@@ -125,6 +125,30 @@ Stage-0 goldens (`_indextts2-oracle/goldens/`, 23 files + manifest; seed=42 tupl
   explicit caller-chosen parameter.
 - Resolved config = donor constructor defaults, cross-checked vs checkpoint config.yaml
   (only DiT block_size differs, 16384 vs 8192 — positions ≤621, inert; donor kept).
+
+## P5 notes (banked)
+
+- **Files:** `Models/BigVGANV2.swift` (AMPBlock1/2 + BigVGANV2) + `Models/Activations.swift`
+  (kaiser-sinc filter, Snake/SnakeBeta, UpSample1d/DownSample1d/Activation1d) — isomorphic to
+  donor `models/{bigvgan_v2,activations}.py`. bigvgan.safetensors loads with NO sanitize
+  (449 keys 1:1; vanch007 pre-fused weight norms; conv weights already MLX layout).
+- **NEW MLX-Swift PITFALL — shared-init parameter aliasing:** assigning ONE MLXArray instance
+  to two `@ParameterInfo` wrappers (SnakeBeta alpha/beta both = `initial`) makes update()
+  write both keys into the same array — last write wins, alpha silently gets beta's values.
+  Key contract AND `verify: .all` both pass. Symptom: gate cos ~0.05; ladder localized it in
+  one hop (probe_act 1.5e0 while manual-formula check was 1.6e-3). Always allocate distinct
+  init arrays per parameter.
+- **Anti-alias filters are computed, not checkpoint keys** — UpSample1d/DownSample1d are plain
+  non-Module classes (donor underscore-prefixes `_filter`); np.kaiser/i0 replicated in Double
+  then cast fp32. Depthwise (identical-filter, groups=C) convs = channel-fold into batch.
+- **Elementwise stage gating is miscalibrated for deep snake stacks:** fp32-CPU vs fp16-Metal
+  drift amplifies through 6 stages of oscillatory sin²(αx) (stage_3 max_abs ~2.0 with cos
+  0.994 — benign). The Python reference ITSELF diverges from its Metal golden by max_abs 0.026
+  / cos 0.9995 e2e on the CPU stream. Ladder = report-only localization; hard gate = final
+  waveform cosine (Swift landed at the reference's exact floor: 0.99950 vs 0.99954).
+- v2 config quirks: conv_post bias=False, final activation = clip(-1,1) not tanh,
+  snakebeta-with-logscale everywhere. Checkpoint = nvidia/bigvgan_v2_22khz_80band_256x
+  (rates 4,4,2,2,2,2 · kernels 8,8,4,4,4,4 · 1536→24ch · resblock kernels 3,7,11 × d 1,3,5).
 
 ## Dependencies by phase
 

@@ -556,6 +556,106 @@ func gateP4() throws {
     print("P4 GATE PASSED")
 }
 
+// MARK: - Shared BigVGAN loader (P5/P6)
+
+func loadBigVGAN() throws -> BigVGANV2 {
+    let model = BigVGANV2()
+    let declared = Set(model.parameters().flattened().map(\.0))
+
+    let raw = try loadArrays(url: weightsDir.appending(path: "bigvgan.safetensors"))
+
+    let missing = declared.subtracting(raw.keys)
+    let unused = Set(raw.keys).subtracting(declared)
+    guard missing.isEmpty else { fail("missing keys: \(missing.sorted().prefix(8)) …") }
+    guard unused.isEmpty else { fail("unused keys: \(unused.sorted().prefix(8)) …") }
+    print("  keys: \(raw.count) (declared \(declared.count)); contract 0-missing/0-unused OK")
+
+    let fp32 = raw.mapValues { $0.asType(.float32) }
+    try model.update(parameters: ModuleParameters.unflattened(fp32), verify: .all)
+    eval(model)
+    return model
+}
+
+// MARK: - P5 gate: BigVGAN v2 vocoder
+
+func gateP5() throws {
+    Device.setDefault(device: Device(.cpu))
+
+    print("→ building BigVGANV2 + loading bigvgan.safetensors")
+    let model = try loadBigVGAN()
+
+    func gate(_ name: String, mel: MLXArray, goldenFile: String) throws {
+        let promptLen = 431
+        let wav = model(mel[0..., 0..., promptLen...])
+        eval(wav)
+        let golden = try NPY.load(goldensDir.appending(path: goldenFile)).asType(.float32)
+        guard wav.shape == golden.shape else {
+            fail("\(name): shape \(wav.shape) vs golden \(golden.shape)")
+        }
+        let cos = cosine(wav, golden)
+        let mad = maxAbsDiff(wav, golden)
+        print(String(format: "  %@ cos=%.7f max_abs=%.5f",
+                     name.padding(toLength: 22, withPad: " ", startingAt: 0), cos, mad))
+        guard cos >= 0.999 else { fail(String(format: "%@ cos %.7f < 0.999", name, cos)) }
+    }
+
+    // --- per-stage ladder (goldens/bigvgan, dumped by tools/dump_bigvgan_ladder.py) ---
+    // Report-only: stage max_abs drifts benignly vs the Metal-fp16 goldens (the Python
+    // reference itself shows max_abs 0.026 e2e on the CPU stream); a structural break shows
+    // as orders of magnitude (the snake-alias bug read 1.5e0 here). Cosine also reported —
+    // it stays ~1.0 for benign drift. The hard gate is the final waveform cosine below.
+    let ladder = goldensDir.appending(path: "bigvgan")
+    if FileManager.default.fileExists(atPath: ladder.path) {
+        func check(_ name: String, _ ours: MLXArray) throws {
+            let g = try NPY.load(ladder.appending(path: "\(name).npy")).asType(.float32)
+            guard ours.shape == g.shape else { fail("\(name): shape \(ours.shape) vs \(g.shape)") }
+            print(String(format: "  %@ max_abs = %.3e  cos=%.7f",
+                         name.padding(toLength: 18, withPad: " ", startingAt: 0),
+                         maxAbsDiff(ours, g), cosine(ours, g)))
+        }
+
+        print("→ ladder: anti-alias primitive probes")
+        let melL = try NPY.load(goldensDir.appending(path: "core_s2mel_cfm_mel_seed42.npy"))
+            .asType(.float32)[0..., 0..., 431...]
+        var x = model.convPreLayer(melL.transposed(0, 2, 1)).transposed(0, 2, 1)
+        try check("conv_pre", x)
+
+        let probe = try NPY.load(ladder.appending(path: "probe_in.npy")).asType(.float32)
+        let act1d = model.resblockModules[0].activationModules[0]
+        let probeUp = act1d.upsample(probe)
+        try check("probe_upsample", probeUp)
+        try check("probe_act", act1d.applyAct(probeUp))
+        try check("probe_act1d", act1d(probe))
+        try check("probe_downsample", act1d.downsample(probe))
+
+        print("→ ladder: upsample stages")
+        for i in 0 ..< model.numUpsamples {
+            x = model.upsLayers[i](x.transposed(0, 2, 1)).transposed(0, 2, 1)
+            try check("ups_\(i)", x)
+            var xs: MLXArray? = nil
+            for j in 0 ..< model.numKernels {
+                let res = model.resblockModules[i * model.numKernels + j](x)
+                xs = xs.map { $0 + res } ?? res
+            }
+            x = xs! / Float(model.numKernels)
+            try check("stage_\(i)", x)
+        }
+        try check("activation_post", model.activationPostModule(x))
+    }
+
+    print("→ vocoding seed-42 replay mel (trim prompt 431 → (1,80,190))")
+    let melSeed42 = try NPY.load(goldensDir.appending(path: "core_s2mel_cfm_mel_seed42.npy")).asType(.float32)
+    let start = Date()
+    try gate("bigvgan_wav(seed42)", mel: melSeed42, goldenFile: "core_bigvgan_wav_seed42.npy")
+    print(String(format: "  (%.2fs)", Date().timeIntervalSince(start)))
+
+    print("→ vocoding ORIGINAL Stage-0 mel golden")
+    let melOrig = try NPY.load(goldensDir.appending(path: "core_s2mel_cfm_mel.npy")).asType(.float32)
+    try gate("bigvgan_wav(orig)", mel: melOrig, goldenFile: "core_bigvgan_wav.npy")
+
+    print("P5 GATE PASSED")
+}
+
 // MARK: - Entry
 
 let mode = CommandLine.arguments.dropFirst().first ?? "p2"
@@ -568,7 +668,8 @@ do {
     case "p3cpp": try gateP3CampPlus()
     case "p3cond": try gateP3Conditioners()
     case "p4": try gateP4()
-    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc | p3cpp | p3cond | p4)")
+    case "p5": try gateP5()
+    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc | p3cpp | p3cond | p4 | p5)")
     }
 } catch {
     fail("\(error)")
