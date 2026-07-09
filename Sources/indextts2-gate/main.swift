@@ -48,6 +48,27 @@ let defaultGoldens = home.appending(path: "Development/_indextts2-oracle/goldens
 let weightsDir = argValue("--weights").map { URL(fileURLWithPath: $0) } ?? defaultWeights
 let goldensDir = argValue("--goldens").map { URL(fileURLWithPath: $0) } ?? defaultGoldens
 
+/// Shared UnifiedVoiceV2 loader: full-model key contract (0-missing/0-unused after
+/// sanitize), fp32 upcast materialized before any forward (watchdog corollary).
+func loadUnifiedVoiceV2() throws -> UnifiedVoiceV2 {
+    let model = UnifiedVoiceV2()
+    let declared = Set(model.parameters().flattened().map(\.0))
+
+    let raw = try loadArrays(url: weightsDir.appending(path: "gpt.safetensors"))
+    let sanitized = UnifiedVoiceV2.sanitize(raw)
+
+    let missing = declared.subtracting(sanitized.keys)
+    let unused = Set(sanitized.keys).subtracting(declared)
+    guard missing.isEmpty else { fail("missing keys: \(missing.sorted().prefix(8)) …") }
+    guard unused.isEmpty else { fail("unused keys: \(unused.sorted().prefix(8)) …") }
+    print("  keys: \(sanitized.count) (declared \(declared.count)); contract 0-missing/0-unused OK")
+
+    let fp32 = sanitized.mapValues { $0.asType(.float32) }
+    try model.update(parameters: ModuleParameters.unflattened(fp32), verify: .all)
+    eval(model)
+    return model
+}
+
 // MARK: - P2 gate
 
 func gateP2() throws {
@@ -61,28 +82,8 @@ func gateP2() throws {
     let goldenLatent = try NPY.load(goldensDir.appending(path: "core_gpt_latent.npy")).asType(.float32)
     print("  conditioning \(conditioning.shape)  text \(textTokens.shape)  mel \(melCodes.shape)  golden \(goldenLatent.shape)")
 
-    print("→ building UnifiedVoiceV2 (P2 subset) + loading gpt.safetensors subset")
-    let model = UnifiedVoiceV2()
-    let declared = Set(model.parameters().flattened().map(\.0))
-
-    let all = try loadArrays(url: weightsDir.appending(path: "gpt.safetensors"))
-    let subset = all.filter { declared.contains($0.key) }
-
-    // Declared-subset key contract: 0 missing / 0 unused within the declared tree.
-    let onDisk = Set(subset.keys)
-    let missing = declared.subtracting(onDisk)
-    let p3Families = ["conditioning_encoder.", "perceiver_encoder.", "emo_conditioning_encoder.",
-                      "emo_perceiver_encoder.", "emo_layer.", "emovec_layer."]
-    let unusedOutsideP3 = Set(all.keys).subtracting(declared)
-        .filter { key in !p3Families.contains(where: { key.hasPrefix($0) }) }
-    guard missing.isEmpty else { fail("missing keys: \(missing.sorted().prefix(8)) …") }
-    guard unusedOutsideP3.isEmpty else { fail("unexpected non-P3 keys on disk: \(unusedOutsideP3.sorted().prefix(8)) …") }
-    print("  subset keys: \(subset.count) (declared \(declared.count)); P3 families deferred: OK")
-
-    // fp32 upcast, materialized before the forward (watchdog corollary).
-    let fp32 = subset.mapValues { $0.asType(.float32) }
-    try model.update(parameters: ModuleParameters.unflattened(fp32), verify: .all)
-    eval(model)
+    print("→ building UnifiedVoiceV2 + loading gpt.safetensors")
+    let model = try loadUnifiedVoiceV2()
 
     print("→ teacher-forced forwardLatent")
     let start = Date()
@@ -399,6 +400,52 @@ func gateP3CampPlus() throws {
     print("P3B-CAMPPLUS GATE PASSED")
 }
 
+// MARK: - P3b GPT conditioner gate (conformer + perceiver + emovec + full conditioning)
+
+func gateP3Conditioners() throws {
+    Device.setDefault(device: Device(.cpu))
+
+    print("→ building UnifiedVoiceV2 + loading gpt.safetensors")
+    let model = try loadUnifiedVoiceV2()
+
+    // Oracle inputs/goldens (fp16-weight MLX-Metal capture → cos gates, like P2).
+    let spkCondEmb = try NPY.load(goldensDir.appending(path: "frontend_ref__spk_cond_emb.npy")).asType(.float32)
+    let spkNCL = spkCondEmb.transposed(0, 2, 1)  // (1, 1024, T) NCL, as generate_v2 feeds it
+
+    func gate(_ name: String, _ ours: MLXArray, _ goldenFile: String) throws {
+        let golden = try NPY.load(goldensDir.appending(path: goldenFile)).asType(.float32)
+        guard ours.shape == golden.shape else {
+            fail("\(name): shape \(ours.shape) vs golden \(golden.shape)")
+        }
+        let cos = cosine(ours, golden)
+        let mad = maxAbsDiff(ours, golden)
+        print(String(format: "  %@ cos=%.7f max_abs=%.5f",
+                     name.padding(toLength: 22, withPad: " ", startingAt: 0), cos, mad))
+        guard cos >= 0.999 else { fail(String(format: "%@ cos %.7f < 0.999", name, cos)) }
+    }
+
+    print("→ get_conditioning (speaker conformer + 32-latent perceiver)")
+    let speechCond = model.getConditioning(spkNCL)
+    eval(speechCond)
+    try gate("speech_cond", speechCond, "core_gpt_speech_cond.npy")
+
+    print("→ get_emovec (emotion conformer + 1-latent perceiver + emovec/emo layers)")
+    let baseEmovec = model.getEmovec(spkNCL)
+    eval(baseEmovec)
+    try gate("base_emovec", baseEmovec, "core_gpt_base_emovec.npy")
+
+    print("→ prepare_conditioning_latents (emotion 'happy' α=0.6 blend)")
+    // generate_v2: weights={happy: 1.0}·α → weight_sum=0.6 → emo_vec = mat + 0.4·base
+    let emovecMat = try NPY.load(goldensDir.appending(path: "frontend_emovec_mat.npy")).asType(.float32)
+    let emoVec = emovecMat + 0.4 * baseEmovec
+    let conditioning = model.prepareConditioningLatents(
+        speechConditioning: speechCond, emoVec: emoVec, batchSize: 1)
+    eval(conditioning)
+    try gate("conditioning", conditioning, "core_gpt_conditioning.npy")
+
+    print("P3B-CONDITIONERS GATE PASSED")
+}
+
 // MARK: - Entry
 
 let mode = CommandLine.arguments.dropFirst().first ?? "p2"
@@ -409,7 +456,8 @@ do {
     case "p3w2v": try gateP3W2VBert()
     case "p3mgc": try gateP3MaskGCT()
     case "p3cpp": try gateP3CampPlus()
-    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc | p3cpp)")
+    case "p3cond": try gateP3Conditioners()
+    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc | p3cpp | p3cond)")
     }
 } catch {
     fail("\(error)")
