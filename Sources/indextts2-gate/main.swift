@@ -873,6 +873,142 @@ func gateP6() throws {
     print("P6 GATE PASSED")
 }
 
+// MARK: - P7 gate: AR sampling loop
+
+// Gate doctrine (exact-match ceiling): sampled sequences are NOT gated token-exact across
+// backends — AR amplifies knife-edge flips. Gates: (a) greedy (temp=0) short run token-exact
+// vs the oracle's fp32-CPU capture (tools/dump_ar_greedy.py), (b) step-0 raw logits
+// cos ≥ 0.9999, (c) seeded sampling produces valid codes (stop emitted, sane length) whose
+// e2e WAV is non-silent and speech-like (dBFS in range).
+func gateP7AR() throws {
+    Device.setDefault(device: Device(.cpu))
+    let ar = goldensDir.appending(path: "ar")
+
+    print("→ building UnifiedVoiceV2 + loading gpt.safetensors")
+    let model = try loadUnifiedVoiceV2()
+
+    let conditioning = try NPY.load(goldensDir.appending(path: "core_gpt_conditioning.npy")).asType(.float32)
+    let textTokens = try NPY.load(goldensDir.appending(path: "core_gpt_latent__in0.npy"))
+
+    // --- (a)+(b): greedy short run — token-exact + logits ladder ---
+    print("→ greedy run (temp 0, rep 10.0, cap 300) vs oracle fp32-CPU capture")
+    var stepLogits: [Int: MLXArray] = [:]
+    var start = Date()
+    let greedy = model.generateMelCodes(
+        conditioning: conditioning, textTokens: textTokens, maxMelTokens: 300,
+        temperature: 0, topK: 30, topP: 0.8, repetitionPenalty: 10.0,
+        stepLogitsHook: { i, logits in
+            if i < 8 { stepLogits[i] = logits[0..., 0, 0...].asType(.float32) }
+        })
+    let greedyTime = Date().timeIntervalSince(start)
+    print(String(format: "  %d tokens, stopped=%@ (%.1fs, %.0f ms/token)",
+                 greedy.melCodes.count, String(greedy.stopped), greedyTime,
+                 1000 * greedyTime / Double(greedy.melCodes.count + 1)))
+
+    let logits0Golden = try NPY.load(ar.appending(path: "ar_step0_logits.npy")).asType(.float32)
+    let cos0 = cosine(stepLogits[0]!, logits0Golden)
+    print(String(format: "  step-0 logits cos=%.7f max_abs=%.5f", cos0,
+                 maxAbsDiff(stepLogits[0]!, logits0Golden)))
+    for i in 1 ..< 8 {
+        let file = ar.appending(path: String(format: "ar_greedy_logits_%02d.npy", i))
+        guard FileManager.default.fileExists(atPath: file.path), let mine = stepLogits[i] else { continue }
+        let g = try NPY.load(file).asType(.float32)
+        print(String(format: "  step-%d logits cos=%.7f (report-only)", i, cosine(mine, g)))
+    }
+    guard cos0 >= 0.9999 else { fail(String(format: "step-0 logits cos %.7f < 0.9999", cos0)) }
+
+    let goldenTokensArr = try NPY.load(ar.appending(path: "ar_greedy_tokens.npy")).asType(.int32)
+    eval(goldenTokensArr)
+    let goldenTokens = (0 ..< goldenTokensArr.dim(0)).map { Int(goldenTokensArr[$0].item(Int32.self)) }
+    guard greedy.stopped else { fail("greedy run did not emit stop token (oracle did)") }
+    if greedy.melCodes == goldenTokens {
+        print("  greedy tokens \(greedy.melCodes.count)/\(goldenTokens.count) EXACT ✓")
+    } else {
+        let n = min(greedy.melCodes.count, goldenTokens.count)
+        let firstDiff = (0 ..< n).first { greedy.melCodes[$0] != goldenTokens[$0] } ?? n
+        fail("greedy tokens diverge at step \(firstDiff) "
+             + "(ours \(greedy.melCodes.count) vs golden \(goldenTokens.count) tokens)")
+    }
+
+    // --- (c): seeded sampling validity + e2e WAV ---
+    print("→ seeded sampling (seed 42; temp 0.8, top_k 30, top_p 0.8, rep 10.0)")
+    MLXRandom.seed(42)
+    start = Date()
+    let sampled = model.generateMelCodes(
+        conditioning: conditioning, textTokens: textTokens, maxMelTokens: 600,
+        temperature: 0.8, topK: 30, topP: 0.8, repetitionPenalty: 10.0)
+    print(String(format: "  %d raw tokens, stopped=%@ (%.1fs)",
+                 sampled.melCodes.count, String(sampled.stopped),
+                 Date().timeIntervalSince(start)))
+    guard sampled.stopped else { fail("sampled run did not emit stop token within 600") }
+    guard (20 ... 600).contains(sampled.melCodes.count) else {
+        fail("sampled length \(sampled.melCodes.count) not in 20...600")
+    }
+    let maxCode = sampled.melCodes.max() ?? 0
+    guard maxCode < 8192 else { fail("sampled code \(maxCode) out of codebook range") }
+    let codes = compressSilence(sampled.melCodes)
+    print("  compress_silence: \(sampled.melCodes.count) → \(codes.count) codes"
+          + String(format: " (~%.2fs speech)", Double(codes.count) * 1.72 * 256.0 / 22050.0))
+
+    print("→ e2e: forwardLatent → S2Mel → CFM (native z) → BigVGAN")
+    let melCodesArr = MLXArray(codes.map(Int32.init)).reshaped(1, codes.count)
+    let latent = model.forwardLatent(
+        conditioning: conditioning, textTokens: textTokens, melCodes: melCodesArr)
+    eval(latent)
+
+    let s2mel = try loadS2Mel()
+    let vq2emb = Vq2Emb()
+    do {
+        let raw = try loadArrays(url: weightsDir.appending(path: "vq2emb.safetensors"))
+        let sanitized = Vq2Emb.sanitize(raw).mapValues { $0.asType(.float32) }
+        try vq2emb.update(parameters: ModuleParameters.unflattened(sanitized), verify: .all)
+        eval(vq2emb)
+    }
+
+    let gptlayerOut = s2mel.gptLayerModule(latent)
+    let sInfer = vq2emb(melCodesArr).transposed(0, 2, 1) + gptlayerOut
+    let cond = s2mel.lengthRegulatorModule(
+        sInfer, ylens: MLXArray([Int32(Float(codes.count) * 1.72)]))
+
+    let promptCondition = try NPY.load(goldensDir.appending(path: "frontend_ref__prompt_condition.npy")).asType(.float32)
+    let refMel = try NPY.load(goldensDir.appending(path: "frontend_ref__ref_mel.npy")).asType(.float32)
+    let style = try NPY.load(goldensDir.appending(path: "frontend_ref__style.npy")).asType(.float32)
+    let catCondition = concatenated([promptCondition, cond], axis: 1)
+    let mel = s2mel.cfmModule.inference(
+        mu: catCondition, xLens: MLXArray([Int32(catCondition.dim(1))]),
+        prompt: refMel, style: style,
+        nTimesteps: 25, temperature: 1.0, inferenceCfgRate: 0.7)
+    eval(mel)
+
+    let bigvgan = try loadBigVGAN()
+    let wav = bigvgan(mel[0..., 0..., refMel.dim(2)...])
+    eval(wav)
+
+    var audio = wav[0, 0]
+    let peak = MLX.abs(audio).max().item(Float.self)
+    if peak > 1.0 { audio = audio / max(peak, 1e-6) }
+    audio = clip(audio, min: -0.99, max: 0.99)
+    eval(audio)
+
+    let n = audio.dim(0)
+    let rms = sqrt(mean(audio * audio)).item(Float.self)
+    let dbfs = 20 * log10(max(rms, 1e-12))
+    print(String(format: "  %d samples (%.2fs)  RMS=%.4f  dBFS=%.1f  peak=%.3f",
+                 n, Float(n) / 22050.0, rms, dbfs, peak))
+
+    var samples = [Float](repeating: 0, count: n)
+    for i in 0 ..< n { samples[i] = audio[i].item(Float.self) }
+    let wavURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appending(path: "PORTING/p7_sampled_seed42.wav")
+    try writeWAV(samples, sampleRate: 22050, to: wavURL)
+    print("  wrote \(wavURL.path)")
+
+    // Speech-like band: golden run sits at −23 dBFS; sampling variance stays well inside.
+    guard dbfs > -35 && dbfs < -10 else { fail(String(format: "dBFS %.1f outside (−35, −10)", dbfs)) }
+
+    print("P7-AR GATE PASSED")
+}
+
 // MARK: - Entry
 
 let mode = CommandLine.arguments.dropFirst().first ?? "p2"
@@ -887,7 +1023,8 @@ do {
     case "p4": try gateP4()
     case "p5": try gateP5()
     case "p6": try gateP6()
-    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc | p3cpp | p3cond | p4 | p5 | p6)")
+    case "p7ar": try gateP7AR()
+    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc | p3cpp | p3cond | p4 | p5 | p6 | p7ar)")
     }
 } catch {
     fail("\(error)")
