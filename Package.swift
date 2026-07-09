@@ -8,21 +8,32 @@ import PackageDescription
 //
 // Parity gates live in the `indextts2-gate` CLI lane (NOT XCTest — the SPM test product's
 // metallib is unreliable; `swift run` is the doctrine for gates that touch kernels).
-// XCTest carries only offline checks (tokenizer parity, weight-free key contracts).
-// MLXToolKit (engine contract) arrives at Stage 2.
+// XCTest carries the offline checks (tokenizer parity, weight-free key contracts, the
+// Stage-2 manifest + MAT-1..5 materialization gate).
+//
+// Stage 2: `MLXIndexTTS2TTS` is the engine-facing wrapper (IndexTTS2Configuration +
+// IndexTTS2Package) over the `MLXIndexTTS2` core — same split as MLXVoxCPM2TTS/MLXQwen3TTS.
+// The core stays MLXToolKit-free. Engine contract is a local-path dep during WIP
+// (pin a tagged mlx-engine-swift ≥0.23.0 — the LicenseRef-Index-Model entry — at publish).
 let package = Package(
     name: "mlx-indextts2-swift",
     platforms: [
-        .macOS(.v14)
+        .macOS(.v26)
     ],
     products: [
         .library(name: "MLXIndexTTS2", targets: ["MLXIndexTTS2"]),
+        .library(name: "MLXIndexTTS2TTS", targets: ["MLXIndexTTS2TTS"]),
         .executable(name: "indextts2-gate", targets: ["indextts2-gate"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
         // Shared STFT/mel primitives (local path during WIP; publish before tagging).
         .package(path: "../mlx-audio-dsp"),
+        // Engine contract (local path during WIP — needs the unreleased LicenseRef-Index-Model
+        // + emotionControl/durationControl specialty entries).
+        .package(path: "../../../MLXEngine/mlx-engine-swift"),
+        // Native downloader for WeightSourcing auto-materialization.
+        .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
     ],
     targets: [
         .target(
@@ -45,9 +56,24 @@ let package = Package(
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
+        .target(
+            name: "MLXIndexTTS2TTS",
+            dependencies: [
+                "MLXIndexTTS2",
+                .product(name: "MLXToolKit", package: "mlx-engine-swift"),
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXAudioDSP", package: "mlx-audio-dsp"),
+                .product(name: "HuggingFace", package: "swift-huggingface"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
         .testTarget(
             name: "MLXIndexTTS2Tests",
-            dependencies: ["MLXIndexTTS2"],
+            dependencies: [
+                "MLXIndexTTS2",
+                "MLXIndexTTS2TTS",
+                .product(name: "MLXServeConformance", package: "mlx-engine-swift"),
+            ],
             resources: [.copy("Resources")]
         ),
     ]
