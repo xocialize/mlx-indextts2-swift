@@ -16,7 +16,7 @@ Stage-0 goldens (`_indextts2-oracle/goldens/`, 23 files + manifest; seed=42 tupl
 | P4 | S2Mel CFM + length regulator | `cfm_mel` golden (seed-42 replay set) | **PASSED 2026-07-08** (`p4`: gptlayer cos 1.0000002, lenreg max_abs 0.0 BITWISE, dit_step1 cos 1.0000005, cfm_mel cos 0.9999999 over 25 steps; 264-key contract 0-missing/0-unused; seeded-normal cross-binding max_abs 4.8e-7) |
 | P5 | BigVGAN2 vocoder | `bigvgan_wav` golden + listen | **PASSED 2026-07-08** (`p5`: wav(seed42) cos 0.9995050 / wav(orig) cos 0.9995069 — equals the Python reference's own CPU-vs-Metal floor (0.9995355); 449-key contract; all anti-alias primitive probes ≤7.4e-3) |
 | P6 | e2e | Stage-0 WAV, quantified (dBFS/RMS, not ears) | **PASSED 2026-07-08** (`p6`: 12 native stages, all ≥0.9999970; e2e audio RMS 0.0711/−23.0 dBFS vs golden 0.0695/−23.2; wav cos 0.9786 = inside BigVGAN's inherent chaos band (python itself: 0.9945 @9e-4 mel perturb); \|STFT\| cos 0.9998; WAV at PORTING/p6_e2e_seed42.wav) |
-| P7 | GPU smoke + int8 quant | GPU-stream forward (never CPU-pin quant!) | — |
+| P7 | AR sampling + GPU smoke + quant | (a) greedy token-exact + step-0 logits ≥0.9999 vs fp32-CPU oracle capture; (b) full chain on GPU stream, stages ≥0.999 + \|STFT\| ≥0.999; (c) int8/int4 gpt_latent ≥0.9999/≥0.99 + e2e validity (forwards GPU-only) | **PASSED 2026-07-09** (`p7ar`: greedy 114/114 EXACT, step-0 logits cos 0.9999999, sampled(42) 111 tokens → −23.3 dBFS; `p7gpu`: all stages ≥0.9995, GPU greedy 114/114, \|STFT\| 0.9997976, pure-vocode raw 0.9999903; `p7quant`: int8 0.9999846 / int4 0.9952125, both e2e valid) |
 
 ## P1 notes (banked)
 
@@ -170,6 +170,67 @@ Stage-0 goldens (`_indextts2-oracle/goldens/`, 23 files + manifest; seed=42 tupl
   param plane); (3) audio_16k PCM decode/resample = media-bridge layer by design;
   (4) AR sampling loop (`generate_step` top-k/top-p/repetition) = P7.
 - 16-bit PCM WAV writer lives in the gate CLI; output at `PORTING/p6_e2e_seed42.wav` (2.21 s).
+
+## P7 notes (banked)
+
+- **Files:** `Models/UnifiedVoiceV2+Generate.swift` — isomorphic port of gpt_v2.py
+  `prepare_inputs` / `generate_step` / `_apply_repetition_penalty` / `_sample` + the
+  generate_v2.py AR driver + generate.py `compress_silence`. Behavior-preserving
+  deviations: the repetition penalty's per-token one-hot loop is one vectorized
+  vocab-mask pass; the top-p unsort scatter uses native `putAlong` instead of the
+  donor's numpy round-trip (survivors are a prefix of the descending sort, identical
+  result). Oracle fixture tool: `_indextts2-oracle/tools/dump_ar_greedy.py` (fp32
+  upcast, CPU stream → goldens/ar/).
+- **Gate doctrine held:** sampled sequences are never gated token-exact across
+  backends. Greedy (temp 0, rep-penalty 10) fp32-CPU vs fp32-CPU IS token-exact:
+  114/114. Bonus observation: the seeded (42) sampled run reproduces the Stage-0
+  capture's shape (111 tokens, −23.3 vs −23.2 dBFS) — the Swift RNG stream tracks
+  Python's through `categorical`; and GPU greedy also matched the CPU capture 114/114.
+- **GPU smoke:** loads pinned CPU-stream, all forwards GPU. Raw waveform cosine is
+  chaos-dominated on GPU (0.9476) while the pure-vocode diagnostic (golden mel → GPU
+  vocoder) reads raw 0.9999903 — the vocoder is exact vs its Metal-fp16 golden; the
+  drift is upstream-mel amplification (P6 calibration). **GPU wav gate = |STFT|-mag
+  cos ≥0.999** (measured 0.9997976; helper `stftMagCosine` on MLXAudioDSP, new gate
+  dep) + raw-cos 0.90 structural floor + dBFS band.
+- **Quantization** (scope = donor's: `gpt.h.*` Linears only, 96 layers, group 64;
+  embeddings/heads/norms/conditioners/S2Mel/vocoder full precision): int8 gpt_latent
+  cos 0.9999846, int4 0.9952125; both sampled-AR e2e valid. Load+quantize CPU-stream,
+  forwards GPU-ONLY (quant matmul is Metal-only — a CPU-pinned quant forward grinds
+  silently for hours). Unused lever for Stage 2: keep-hi-precision in/out projections
+  if int4 needs a lift (int4 has 0.005 headroom over its 0.99 gate).
+- **Timings** (M-series, warm shader cache, GPU): AR ≈ 13 ms/token fp32, ≈ 10 ms/token
+  quantized; CFM 25 steps 0.90 s; BigVGAN 0.64 s; full chain ≈ 5 s for 2.2 s of audio.
+  CPU-stream AR ≈ 51 ms/token (gate lane only).
+
+## Footprints (measured 2026-07-09; Stage-2 split-footprint manifest inputs)
+
+On-disk weights (per-component, production dtypes as shipped):
+
+| component | file | size | dtype |
+|---|---|---|---|
+| GPT (UnifiedVoiceV2 incl. conditioners) | gpt.safetensors | 1652 MB | fp16 |
+| S2Mel (CFM/DiT/lenreg) | s2mel.safetensors | 198 MB | fp16 |
+| BigVGAN v2 | bigvgan.safetensors | 214 MB | fp16 |
+| vq2emb | vq2emb.safetensors | 0.15 MB | fp16 |
+| w2v-BERT 2.0 (front-end) | model.safetensors | 2214 MB | **fp32** (HF ships fp32; fp16 conversion = Stage-2 lever → ~1.1 GB) |
+| MaskGCT semantic codec | semantic_codec/model.safetensors | 169 MB | fp32 |
+| CampPlus | campplus_cn_common.safetensors | 27 MB | fp32 |
+
+Measured process residents (gate lane = **fp32-upcast** weights; production fp16
+residents ≈ on-disk sizes above, re-measure with MemoryProbe at Stage 2):
+
+| configuration | resident (post-load) | GPU forward peak |
+|---|---|---|
+| full chain fp32 (all 7 components) | 6539 MB | 9157 MB (e2e incl. w2v-BERT/CFM/BigVGAN) |
+| core TTS fp32 (GPT+S2Mel+BigVGAN+vq2emb) | 4130 MB | 5782 MB (AR + S2Mel + vocoder e2e) |
+| core TTS, GPT backbone **int8** | 2837 MB (Δ −1293) | ~5.8 GB |
+| core TTS, GPT backbone **int4** | 2616 MB (Δ −1518) | ~5.8 GB |
+
+Notes: activation peak is dominated by CFM/BigVGAN fp32 activations, not the GPT —
+quantization moves residents, not the peak. Buffer-pool cache grew to ~16 GB over the
+full-chain run (engine ≥0.21.0 owns the cacheLimit at Stage 2; gates clearCache()
+between passes). fp16-resident + envelope-sized activation numbers for the manifest's
+`QuantFootprint` come from the Stage-2 MemoryProbe pass at production dtypes.
 
 ## Dependencies by phase
 
