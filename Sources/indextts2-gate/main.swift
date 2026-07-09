@@ -105,13 +105,65 @@ func gateP2() throws {
     }
 }
 
+// MARK: - P3 front-end gate (fbank heads vs HF/torchaudio goldens)
+
+func gateP3Frontend() throws {
+    Device.setDefault(device: Device(.cpu))
+    let fe = goldensDir.appending(path: "frontend")
+
+    func check(_ name: String, _ ours: MLXArray, _ goldenFile: String,
+               cosMin: Float, madMax: Float) throws {
+        let golden = try NPY.load(fe.appending(path: goldenFile)).asType(.float32)
+        let mine = ours.asType(.float32)
+        guard mine.shape == golden.shape else {
+            fail("\(name): shape \(mine.shape) vs golden \(golden.shape)")
+        }
+        let cos = cosine(mine, golden)
+        let mad = maxAbsDiff(mine, golden)
+        print(String(format: "  %@  cos=%.7f  max_abs=%.6f", name, cos, mad))
+        if cos < cosMin || mad > madMax {
+            fail(String(format: "%@ gate failed (cos %.7f < %.4f or max_abs %.6f > %.4f)",
+                        name, cos, cosMin, mad, madMax))
+        }
+    }
+
+    for (tag, audioFile) in [("ref", "audio_16k.npy"), ("synth", "synth_16k.npy")] {
+        var wav = try NPY.load(fe.appending(path: audioFile)).asType(.float32)
+        if wav.ndim == 2 { wav = wav[0] }  // (1, T) → (T,)
+        print("→ \(tag): \(wav.dim(0)) samples")
+
+        guard let sFbank = SeamlessFeatureExtractor.fbank(wav),
+              let (features, mask) = SeamlessFeatureExtractor.callAsFeatures(wav),
+              let cFbank = CampPlusFbank.fbankCMN(wav)
+        else { fail("\(tag): audio shorter than one frame") }
+        eval(sFbank, features, mask, cFbank)
+
+        let suffix = tag == "ref" ? "" : "_synth"
+        if tag == "ref" {
+            try check("seamless fbank raw", sFbank, "seamless_fbank_raw.npy",
+                      cosMin: 0.99999, madMax: 5e-3)
+            let goldenMask = try NPY.load(fe.appending(path: "seamless_attention_mask.npy"))
+            let maskSum = mask.asType(.int32).sum().item(Int32.self)
+            let goldenSum = goldenMask.asType(.int32).sum().item(Int32.self)
+            guard maskSum == goldenSum else { fail("mask sum \(maskSum) vs golden \(goldenSum)") }
+            print("  attention mask sum \(maskSum) ✓")
+        }
+        try check("seamless input_features\(suffix)", features,
+                  "seamless_input_features\(suffix).npy", cosMin: 0.9999, madMax: 2e-2)
+        try check("campplus fbank cmn\(suffix)", cFbank,
+                  "campplus_fbank_cmn\(suffix).npy", cosMin: 0.99999, madMax: 5e-3)
+    }
+    print("P3-FRONTEND GATE PASSED")
+}
+
 // MARK: - Entry
 
 let mode = CommandLine.arguments.dropFirst().first ?? "p2"
 do {
     switch mode {
     case "p2": try gateP2()
-    default: fail("unknown mode \(mode) (expected: p2)")
+    case "p3fe": try gateP3Frontend()
+    default: fail("unknown mode \(mode) (expected: p2 | p3fe)")
     }
 } catch {
     fail("\(error)")

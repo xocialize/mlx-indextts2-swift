@@ -21,6 +21,8 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
+        // Shared STFT/mel primitives (local path during WIP; publish before tagging).
+        .package(path: "../mlx-audio-dsp"),
     ],
     targets: [
         .target(
@@ -28,7 +30,9 @@ let package = Package(
             dependencies: [
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXAudioDSP", package: "mlx-audio-dsp"),
             ],
+            resources: [.copy("Resources")],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .executableTarget(
