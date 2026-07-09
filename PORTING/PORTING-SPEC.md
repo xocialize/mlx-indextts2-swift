@@ -11,7 +11,8 @@ Stage-0 goldens (`_indextts2-oracle/goldens/`, 23 files + manifest; seed=42 tupl
 |---|---|---|---|
 | P1 | tokenizer + normalize (`Text/`) | bit-exact ids/pieces/normalized vs oracle over 13-fixture corpus incl. golden sentence (17 ids) | **PASSED 2026-07-08** (6/6 tests) |
 | P2 | GPT AR (text→semantic) | teacher-forced `gpt_latent` vs golden, cos ≥0.999 fp32 CPU | **PASSED 2026-07-08** (cos 0.9999995, max_abs 0.031; 301-key subset contract 0-missing/0-unused) |
-| P3 | conditioners: w2v-BERT + MaskGCT + CampPlus + perceivers (needs `mlx-audio-dsp` leaf) | per-embed goldens (`spk_cond_emb`, `S_ref`, `style`, `emovec`) | — |
+| P3a | fbank heads (Seamless w2v-BERT FE + CampPlus kaldi) on `mlx-audio-dsp` | vs HF `SeamlessM4TFeatureExtractor` / `torchaudio.compliance.kaldi.fbank` goldens (ref + synth) | **PASSED 2026-07-08** (`p3fe`: fbank cos 1.0000000, input_features 0.9999999 max_abs 1.2e-4, mask 249 exact) |
+| P3b | conditioner models: w2v-BERT Conformer + MaskGCT + CampPlus + conformer/perceivers | per-embed goldens (`spk_cond_emb`, `S_ref`, `style`, `emovec`) | — |
 | P4 | S2Mel CFM + length regulator | `cfm_mel` golden | — |
 | P5 | BigVGAN2 vocoder | `bigvgan_wav` golden + listen | — |
 | P6 | e2e | Stage-0 WAV, quantified (dBFS/RMS, not ears) | — |
