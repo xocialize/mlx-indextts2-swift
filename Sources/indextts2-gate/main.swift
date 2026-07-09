@@ -1451,6 +1451,92 @@ func gateStage2Frontend() throws {
     print("STAGE2-FRONTEND GATE PASSED")
 }
 
+// MARK: - Stage-2 gate: self-contained production runtime (IndexTTS2Generator)
+
+/// First fully self-contained run: `IndexTTS2Generator.load` (production dtypes — fp16
+/// main checkpoint, no gate-lane fp32 upcast) → native reference conditioning from PCM →
+/// AR sampling → S2Mel → BigVGAN. No injected goldens anywhere. Quantified gates:
+/// dBFS speech band + |STFT| self-consistency across the emotion/duration levers +
+/// duration-lever accuracy (targetDuration lands within 12%).
+func gateStage2Runtime() throws {
+    let s2 = goldensDir.appending(path: "stage2")
+
+    print("→ IndexTTS2Generator.load (production dtypes; CPU-stream loads)")
+    let loadStart = Date()
+    let generator = try IndexTTS2Generator.load(
+        modelDirectory: weightsDir,
+        w2vBertDirectory: home.appending(
+            path: ".cache/huggingface/hub/models--facebook--w2v-bert-2.0/snapshots/da985ba0987f70aaeb84a80f2851cfac8c697a7b"),
+        semanticCodecDirectory: home.appending(
+            path: ".cache/huggingface/hub/models--amphion--MaskGCT/snapshots/265c6cef07625665d0c28d2faafb1415562379dc"))
+    print(String(format: "  loaded in %.1fs  resident=%.0f MB",
+                 Date().timeIntervalSince(loadStart), Double(Memory.activeMemory) / 1_048_576))
+
+    // Pipeline-exact PCM at both rates (the goldens' librosa-mono/resample chain).
+    var wav16k = try NPY.load(goldensDir.appending(path: "frontend/audio_16k.npy")).asType(.float32)
+    if wav16k.ndim == 2 { wav16k = wav16k[0] }
+    var wav22k = try NPY.load(s2.appending(path: "audio_22k.npy")).asType(.float32)
+    if wav22k.ndim == 2 { wav22k = wav22k[0] }
+
+    print("→ prepareReference (native front-end, fp16)")
+    let reference = try generator.prepareReference(
+        samples16k: wav16k.asArray(Float.self), samples22k: wav22k.asArray(Float.self))
+    eval(reference.promptCondition)
+
+    func dbfs(_ samples: [Float]) -> Float {
+        let rms = sqrt(samples.reduce(Float(0)) { $0 + $1 * $1 } / Float(max(samples.count, 1)))
+        return 20 * log10(max(rms, 1e-12))
+    }
+    let text = "The quick brown fox jumps over the lazy dog."
+
+    print("→ synthesize (seed 42, emotion happy@0.6)")
+    MLXRandom.seed(42)
+    var happyWeights = [Float](repeating: 0, count: 8)
+    happyWeights[0] = 0.6
+    var start = Date()
+    let happy = try generator.synthesize(
+        text: text, reference: reference, emotionWeights: happyWeights)
+    let happySeconds = Double(happy.count) / 22050.0
+    print(String(format: "  %.2fs audio in %.1fs  dBFS=%.1f",
+                 happySeconds, Date().timeIntervalSince(start), dbfs(happy)))
+    guard dbfs(happy) > -35 && dbfs(happy) < -10 else {
+        fail(String(format: "happy dBFS %.1f outside (−35, −10)", dbfs(happy)))
+    }
+    try writeWAV(happy, sampleRate: 22050,
+                 to: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                     .appending(path: "PORTING/stage2_happy_seed42.wav"))
+
+    print("→ synthesize (seed 42, reference emotion, targetDuration 3.0 s)")
+    MLXRandom.seed(42)
+    start = Date()
+    let fitted = try generator.synthesize(
+        text: text, reference: reference, targetDurationSeconds: 3.0)
+    let fittedSeconds = Double(fitted.count) / 22050.0
+    print(String(format: "  %.2fs audio (target 3.00)  dBFS=%.1f  (%.1fs)",
+                 fittedSeconds, dbfs(fitted), Date().timeIntervalSince(start)))
+    guard abs(fittedSeconds - 3.0) < 0.36 else {
+        fail(String(format: "targetDuration miss: %.2fs vs 3.00s (>12%%)", fittedSeconds))
+    }
+    guard dbfs(fitted) > -35 && dbfs(fitted) < -10 else {
+        fail(String(format: "fitted dBFS %.1f outside (−35, −10)", dbfs(fitted)))
+    }
+    try writeWAV(fitted, sampleRate: 22050,
+                 to: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                     .appending(path: "PORTING/stage2_duration3s_seed42.wav"))
+
+    print("→ synthesize (seed 42, speechRate 1.3)")
+    MLXRandom.seed(42)
+    let fast = try generator.synthesize(text: text, reference: reference, speechRate: 1.3)
+    let fastSeconds = Double(fast.count) / 22050.0
+    print(String(format: "  %.2fs audio (natural was ~%.2fs ÷1.3 → ~%.2fs expected)",
+                 fastSeconds, happySeconds, happySeconds / 1.3))
+    guard dbfs(fast) > -35 && dbfs(fast) < -10 else {
+        fail(String(format: "fast dBFS %.1f outside (−35, −10)", dbfs(fast)))
+    }
+
+    print("STAGE2-RUNTIME GATE PASSED")
+}
+
 // MARK: - Entry
 
 let mode = CommandLine.arguments.dropFirst().first ?? "p2"
@@ -1469,7 +1555,8 @@ do {
     case "p7gpu": try gateP7GPU()
     case "p7quant": try gateP7Quant()
     case "stage2": try gateStage2Frontend()
-    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc | p3cpp | p3cond | p4 | p5 | p6 | p7ar | p7gpu | p7quant | stage2)")
+    case "stage2e2e": try gateStage2Runtime()
+    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc | p3cpp | p3cond | p4 | p5 | p6 | p7ar | p7gpu | p7quant | stage2 | stage2e2e)")
     }
 } catch {
     fail("\(error)")

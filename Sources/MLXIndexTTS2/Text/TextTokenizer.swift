@@ -36,6 +36,14 @@ public final class IndexTTSTextTokenizer: @unchecked Sendable {
         return sp.encode(t)
     }
 
+    /// `tokenize` + ids in one pass — pieces feed `splitSegments`, the paired ids feed the
+    /// model (the Python `convert_tokens_to_ids` step, without a surface→id round-trip).
+    public func encodeWithPieces(_ text: String, normalize: Bool = true) -> [(id: Int, surface: String)] {
+        var t = normalize ? normalizer.normalize(text) : text
+        t = tokenizeByCJKChar(t)
+        return sp.encodeWithPieces(t)
+    }
+
     // MARK: - Long-text segmentation (port of _split_segments_by_token)
 
     public func splitSegments(_ tokens: [String], maxTokensPerSegment: Int = 120) -> [[String]] {
