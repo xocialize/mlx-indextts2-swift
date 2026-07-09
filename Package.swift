@@ -30,6 +30,7 @@ let package = Package(
             dependencies: [
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
                 .product(name: "MLXAudioDSP", package: "mlx-audio-dsp"),
             ],
             resources: [.copy("Resources")],
@@ -37,7 +38,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "indextts2-gate",
-            dependencies: ["MLXIndexTTS2"],
+            dependencies: [
+                "MLXIndexTTS2",
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(

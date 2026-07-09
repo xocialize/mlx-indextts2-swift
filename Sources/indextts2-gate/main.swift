@@ -446,6 +446,116 @@ func gateP3Conditioners() throws {
     print("P3B-CONDITIONERS GATE PASSED")
 }
 
+// MARK: - Shared S2Mel loader (P4/P6)
+
+func loadS2Mel() throws -> S2Mel {
+    let model = S2Mel()
+    let declared = Set(model.parameters().flattened().map(\.0))
+
+    let raw = try loadArrays(url: weightsDir.appending(path: "s2mel.safetensors"))
+    let sanitized = S2Mel.sanitize(raw)
+
+    let missing = declared.subtracting(sanitized.keys)
+    let unused = Set(sanitized.keys).subtracting(declared)
+    guard missing.isEmpty else { fail("missing keys: \(missing.sorted().prefix(8)) …") }
+    guard unused.isEmpty else { fail("unused keys: \(unused.sorted().prefix(8)) …") }
+    print("  keys: \(sanitized.count) (declared \(declared.count)); contract 0-missing/0-unused OK")
+
+    let fp32 = sanitized.mapValues { $0.asType(.float32) }
+    try model.update(parameters: ModuleParameters.unflattened(fp32), verify: .all)
+    eval(model)
+    return model
+}
+
+// MARK: - P4 gate: S2Mel (gpt_layer → length_regulator → CFM)
+
+// The original Stage-0 cfm_mel golden sits past the AR sampler's RNG consumption and is not
+// reproducible from seed(42) alone; P4 gates against the seed-42 REPLAY goldens
+// (tools/dump_s2mel_replay.py — deterministic stages verified bitwise vs the originals).
+func gateP4() throws {
+    Device.setDefault(device: Device(.cpu))
+
+    print("→ building S2Mel + loading s2mel.safetensors")
+    let model = try loadS2Mel()
+
+    func gate(_ name: String, _ ours: MLXArray, _ goldenFile: String, cosMin: Float = 0.999) throws {
+        let golden = try NPY.load(goldensDir.appending(path: goldenFile)).asType(.float32)
+        guard ours.shape == golden.shape else {
+            fail("\(name): shape \(ours.shape) vs golden \(golden.shape)")
+        }
+        let cos = cosine(ours, golden)
+        let mad = maxAbsDiff(ours, golden)
+        print(String(format: "  %@ cos=%.7f max_abs=%.5f",
+                     name.padding(toLength: 22, withPad: " ", startingAt: 0), cos, mad))
+        guard cos >= cosMin else { fail(String(format: "%@ cos %.7f < %.4f", name, cos, cosMin)) }
+    }
+
+    // --- gpt_layer ---
+    print("→ gpt_layer (1280→256→128→1024)")
+    let latent = try NPY.load(goldensDir.appending(path: "core_gpt_latent.npy")).asType(.float32)
+    let gptOut = model.gptLayerModule(latent)
+    eval(gptOut)
+    try gate("gptlayer", gptOut, "core_s2mel_gptlayer.npy")
+
+    // --- length_regulator (golden-injected input for stage isolation) ---
+    print("→ length_regulator (nearest ×1.72 + conv-norm-mish ×4)")
+    let gptGolden = try NPY.load(goldensDir.appending(path: "core_s2mel_gptlayer.npy")).asType(.float32)
+    let vq2emb = try NPY.load(goldensDir.appending(path: "core_vq2emb.npy")).asType(.float32)
+    let sInfer = vq2emb.transposed(0, 2, 1) + gptGolden
+    let codeLen = latent.dim(1)
+    let targetLengths = MLXArray([Int32(Float(codeLen) * 1.72)])
+    let lenregOut = model.lengthRegulatorModule(sInfer, ylens: targetLengths)
+    eval(lenregOut)
+    try gate("lenreg", lenregOut, "core_s2mel_lenreg__0.npy")
+
+    // --- CFM inputs (golden-injected) ---
+    let lenregGolden = try NPY.load(goldensDir.appending(path: "core_s2mel_lenreg__0.npy")).asType(.float32)
+    let promptCondition = try NPY.load(goldensDir.appending(path: "frontend_ref__prompt_condition.npy")).asType(.float32)
+    let refMel = try NPY.load(goldensDir.appending(path: "frontend_ref__ref_mel.npy")).asType(.float32)
+    let style = try NPY.load(goldensDir.appending(path: "frontend_ref__style.npy")).asType(.float32)
+    let catCondition = concatenated([promptCondition, lenregGolden], axis: 1)
+    let xLens = MLXArray([Int32(catCondition.dim(1))])
+
+    // --- RNG cross-binding check: seed(42) → first normal draw must equal the replay z ---
+    print("→ RNG stream check (seed 42 → normal(1,80,\(catCondition.dim(1))))")
+    let zGolden = try NPY.load(goldensDir.appending(path: "core_s2mel_cfm_z_seed42.npy")).asType(.float32)
+    MLXRandom.seed(42)
+    let zSwift = MLXRandom.normal([1, 80, catCondition.dim(1)])
+    eval(zSwift)
+    let zMad = maxAbsDiff(zSwift, zGolden)
+    print(String(format: "  z draw max_abs=%.2e %@", zMad,
+                 zMad == 0 ? "(bit-identical)" : "(NOT bit-identical — CFM gate uses injected z)"))
+
+    // --- single DiT forward (step-1 ladder; isolates the estimator from the ODE loop) ---
+    print("→ DiT single forward (step 1, stacked CFG batch)")
+    let promptLen = refMel.dim(2)
+    let T = catCondition.dim(1)
+    let promptX = concatenated([refMel, MLXArray.zeros([1, 80, T - promptLen])], axis: 2)
+    let x0 = concatenated(
+        [MLXArray.zeros([1, 80, promptLen]), zGolden[0..., 0..., promptLen...]], axis: 2)
+    let stackedDphi = model.cfmModule.estimatorModule(
+        concatenated([x0, x0], axis: 0),
+        promptX: concatenated([promptX, MLXArray.zeros(like: promptX)], axis: 0),
+        xLens: xLens,
+        t: MLXArray([Float(0), Float(0)]),
+        style: concatenated([style, MLXArray.zeros(like: style)], axis: 0),
+        cond: concatenated([catCondition, MLXArray.zeros(like: catCondition)], axis: 0))
+    eval(stackedDphi)
+    try gate("dit_step1", stackedDphi, "core_s2mel_dit_step1_seed42.npy")
+
+    // --- full 25-step CFM (injected z isolates the loop from RNG) ---
+    print("→ CFM inference (25 steps, cfg_rate 0.7, injected z)")
+    let start = Date()
+    let mel = model.cfmModule.inference(
+        mu: catCondition, xLens: xLens, prompt: refMel, style: style,
+        nTimesteps: 25, temperature: 1.0, inferenceCfgRate: 0.7, injectedZ: zGolden)
+    eval(mel)
+    print(String(format: "  (%.2fs)", Date().timeIntervalSince(start)))
+    try gate("cfm_mel", mel, "core_s2mel_cfm_mel_seed42.npy")
+
+    print("P4 GATE PASSED")
+}
+
 // MARK: - Entry
 
 let mode = CommandLine.arguments.dropFirst().first ?? "p2"
@@ -457,7 +567,8 @@ do {
     case "p3mgc": try gateP3MaskGCT()
     case "p3cpp": try gateP3CampPlus()
     case "p3cond": try gateP3Conditioners()
-    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc | p3cpp | p3cond)")
+    case "p4": try gateP4()
+    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc | p3cpp | p3cond | p4)")
     }
 } catch {
     fail("\(error)")

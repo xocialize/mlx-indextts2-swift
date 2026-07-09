@@ -13,7 +13,7 @@ Stage-0 goldens (`_indextts2-oracle/goldens/`, 23 files + manifest; seed=42 tupl
 | P2 | GPT AR (text→semantic) | teacher-forced `gpt_latent` vs golden, cos ≥0.999 fp32 CPU | **PASSED 2026-07-08** (cos 0.9999995, max_abs 0.031; 301-key subset contract 0-missing/0-unused) |
 | P3a | fbank heads (Seamless w2v-BERT FE + CampPlus kaldi) on `mlx-audio-dsp` | vs HF `SeamlessM4TFeatureExtractor` / `torchaudio.compliance.kaldi.fbank` goldens (ref + synth) | **PASSED 2026-07-08** (`p3fe`: fbank cos 1.0000000, input_features 0.9999999 max_abs 1.2e-4, mask 249 exact) |
 | P3b | conditioner models: w2v-BERT Conformer + MaskGCT + CampPlus + conformer/perceivers | per-embed goldens (`spk_cond_emb`, `S_ref`, `style`, `emovec`) | **PASSED 2026-07-08** (`p3w2v` hs-ladder ≤1.93e-04, tap 1.85e-05, FE-chain cos 1.0; `p3mgc` codes 250/250 exact, S_ref 9.5e-07; `p3cpp` ladder ≤4.6e-05, style 5.0e-06; `p3cond` speech_cond/base_emovec/conditioning cos ≥0.999999) |
-| P4 | S2Mel CFM + length regulator | `cfm_mel` golden | — |
+| P4 | S2Mel CFM + length regulator | `cfm_mel` golden (seed-42 replay set) | **PASSED 2026-07-08** (`p4`: gptlayer cos 1.0000002, lenreg max_abs 0.0 BITWISE, dit_step1 cos 1.0000005, cfm_mel cos 0.9999999 over 25 steps; 264-key contract 0-missing/0-unused; seeded-normal cross-binding max_abs 4.8e-7) |
 | P5 | BigVGAN2 vocoder | `bigvgan_wav` golden + listen | — |
 | P6 | e2e | Stage-0 WAV, quantified (dBFS/RMS, not ears) | — |
 | P7 | GPU smoke + int8 quant | GPU-stream forward (never CPU-pin quant!) | — |
@@ -90,6 +90,41 @@ Stage-0 goldens (`_indextts2-oracle/goldens/`, 23 files + manifest; seed=42 tupl
   (still oracle-side; port with the E12 param plane at Stage 2).
 - **P2 gate refactored** onto a shared `loadUnifiedVoiceV2()` full-model loader (the
   declared-subset contract is retired — all 667 gpt.safetensors keys are now declared).
+
+## P4 notes (banked)
+
+- **The original `core_s2mel_cfm_mel` golden is NOT reproducible from seed(42)** — generate_v2
+  seeds once at start and the AR sampler's `mx.random.categorical` draws consume the global
+  stream before CFM's noise draw. P4/P6 gate against the **seed-42 replay goldens**
+  (`_indextts2-oracle/tools/dump_s2mel_replay.py`): seed(42) → `normal(1,80,621)` is the FIRST
+  draw, so both bindings reproduce it. Replay sanity: gpt_layer / length_regulator / bigvgan
+  recomputes are **bitwise identical** to the original goldens (Metal is run-to-run
+  deterministic here); seed-42 cfm_mel is statistically equivalent to the original (cos 0.996).
+- **Cross-binding RNG:** Swift `MLXRandom.seed(42)` → `normal` matches Python within
+  max_abs 4.8e-7 — same stream, tiny fp difference in the normal transform. Fine for
+  production; the parity gate injects the dumped z (`core_s2mel_cfm_z_seed42.npy`) to stay exact.
+- **Files:** `Models/S2Mel.swift` (+GPTLayer), `Models/CFM.swift`, `Models/DiT.swift`,
+  `Models/WaveNet.swift`, `Models/LengthRegulator.swift` — isomorphic to donor
+  `models/s2mel/{s2mel,cfm,dit,wavenet,length_regulator}.py`. VoxCPM's UnifiedCFM was donor
+  for loop idioms only (its math is the opposite 1→0/subtractive convention; key paths don't
+  match s2mel.safetensors → translate-not-lift).
+- **Sanitize remaps (numeric-Sequential pitfall again):** `length_regulator.model.{0,3,6,9}`→
+  `convs.N`, `.{1,4,7,10}`→`norms.N`, `.12`→`out_proj`; `adaLN_modulation.layers.1`→
+  `adaLN_modulation.linear`. Everything else is already donor-MLX layout (no conv transposes;
+  vanch007 pre-fused all weight norms).
+- **Checkpoint-buffer trap:** `t_embedder.freqs` is IN s2mel.safetensors (fp16) and overwrote
+  the donor's computed fp32 buffer at load — declared `@ParameterInfo` so Swift loads the same
+  values. The RoPE table is NOT in the checkpoint — plain non-Module class (donor ditto), keeps
+  it out of the key contract.
+- **Donor-over-torch quirks replicated:** SConv1d does symmetric REFLECT padding (torch WN
+  zero-pads; donor produced the goldens → donor wins); FinalLayer non-affine LayerNorm eps=1e-6;
+  paired/interleaved RoPE (reshape (...,D/2,2), not half-split); hand-rolled attention (no fast
+  SDPA); solve_euler returns the last step BEFORE prompt-region re-zeroing.
+- **Duration control (E12):** the length-regulator target length is the lever —
+  generate_v2 uses `int(code_len * 1.72)`; `InterpolateRegulator(x, ylens:)` keeps it an
+  explicit caller-chosen parameter.
+- Resolved config = donor constructor defaults, cross-checked vs checkpoint config.yaml
+  (only DiT block_size differs, 16384 vs 8192 — positions ≤621, inert; donor kept).
 
 ## Dependencies by phase
 
