@@ -1,0 +1,15 @@
+{
+ "ref": "/Users/dustinnielson/Development/mlxengine-video-ltx/LTX_DEV/LTX_TESTING/fixtures/i7-ORACLE-audio.wav",
+ "model_dir": "/Users/dustinnielson/.cache/huggingface/hub/models--vanch007--mlx-indextts2-standard-fp16/snapshots/31118db400202a438e4d42bbce8e426298072d50",
+ "note": "Stage-2 dumps: ref-mel head + emotion matrices + semantic stats",
+ "selected_spk_indices_happy": [
+  2,
+  11,
+  1,
+  2,
+  2,
+  3,
+  0,
+  7
+ ]
+}

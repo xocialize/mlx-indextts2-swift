@@ -1386,6 +1386,71 @@ func gateP7Quant() throws {
     print("P7-QUANT GATE PASSED")
 }
 
+// MARK: - Stage-2 gate: ref-mel head + preset-emotion path
+
+/// Gates the two former injected-golden boundaries closed for Stage 2:
+/// (a) the 22.05 kHz ref-mel head (`RefMel.melSpectrogram`) vs `refmel_ref`/`refmel_synth`
+///     (the oracle recompute is bitwise-identical to Stage-0 `frontend_ref__ref_mel`);
+/// (b) the preset-emotion path (`EmotionPresets`) vs `frontend_emovec_mat` (happy @ α 0.6)
+///     — matrices baked from feat1/feat2.pt by tools/dump_stage2.py.
+func gateStage2Frontend() throws {
+    Device.setDefault(device: Device(.cpu))
+    let s2 = goldensDir.appending(path: "stage2")
+
+    func check(_ name: String, _ ours: MLXArray, _ golden: MLXArray,
+               cosMin: Float, madMax: Float) {
+        let mine = ours.asType(.float32)
+        let gold = golden.asType(.float32)
+        guard mine.shape == gold.shape else {
+            fail("\(name): shape \(mine.shape) vs golden \(gold.shape)")
+        }
+        let cos = cosine(mine, gold)
+        let mad = maxAbsDiff(mine, gold)
+        print(String(format: "  %@  cos=%.7f  max_abs=%.6f", name, cos, mad))
+        if cos < cosMin || mad > madMax {
+            fail(String(format: "%@ gate failed (cos %.7f < %.4f or max_abs %.6f > %.4f)",
+                        name, cos, cosMin, mad, madMax))
+        }
+    }
+
+    // (a) ref-mel head — ref clip + synth case.
+    for (tag, audioFile, goldenFile) in [("ref", "audio_22k.npy", "refmel_ref.npy"),
+                                         ("synth", "synth_22k.npy", "refmel_synth.npy")] {
+        var wav = try NPY.load(s2.appending(path: audioFile)).asType(.float32)
+        if wav.ndim == 2 { wav = wav[0] }  // (1, T) → (T,)
+        print("→ refmel \(tag): \(wav.dim(0)) samples")
+        let mel = RefMel.melSpectrogram(wav)
+        eval(mel)
+        let golden = try NPY.load(s2.appending(path: goldenFile))
+        check("refmel \(tag)", mel, golden, cosMin: 0.99999, madMax: 5e-3)
+    }
+    // Cross-check vs the Stage-0 pipeline golden directly (same tensor as refmel_ref).
+    let stage0 = try NPY.load(goldensDir.appending(path: "frontend_ref__ref_mel.npy"))
+    var refWav = try NPY.load(s2.appending(path: "audio_22k.npy")).asType(.float32)
+    if refWav.ndim == 2 { refWav = refWav[0] }
+    let stage0Mel = RefMel.melSpectrogram(refWav)
+    eval(stage0Mel)
+    check("refmel vs Stage-0 golden", stage0Mel, stage0, cosMin: 0.99999, madMax: 5e-3)
+
+    // (b) preset-emotion path — happy @ emo_alpha 0.6 (the Stage-0 capture's setting).
+    let style = try NPY.load(goldensDir.appending(path: "frontend_ref__style.npy")).asType(.float32)
+    var weights = [Float](repeating: 0, count: 8)
+    weights[EmotionPresets.categories.firstIndex(of: "happy")!] = 1.0 * 0.6
+    let emovecMat = EmotionPresets.emovecMat(weights: weights, style: style)
+    eval(emovecMat)
+    let goldenEmovec = try NPY.load(goldensDir.appending(path: "frontend_emovec_mat.npy"))
+    check("emovec_mat (happy@0.6)", emovecMat, goldenEmovec, cosMin: 0.999999, madMax: 1e-4)
+
+    // Blend sanity: Σw = 0.6 < 1 ⇒ mat + 0.4·base (the P3b-banked formula).
+    let base = try NPY.load(goldensDir.appending(path: "core_gpt_base_emovec.npy")).asType(.float32)
+    let blended = EmotionPresets.blend(weights: weights, style: style, baseEmovec: base)
+    let manual = emovecMat + 0.4 * base
+    eval(blended, manual)
+    check("emovec blend", blended, manual, cosMin: 0.9999999, madMax: 1e-6)
+
+    print("STAGE2-FRONTEND GATE PASSED")
+}
+
 // MARK: - Entry
 
 let mode = CommandLine.arguments.dropFirst().first ?? "p2"
@@ -1403,7 +1468,8 @@ do {
     case "p7ar": try gateP7AR()
     case "p7gpu": try gateP7GPU()
     case "p7quant": try gateP7Quant()
-    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc | p3cpp | p3cond | p4 | p5 | p6 | p7ar | p7gpu | p7quant)")
+    case "stage2": try gateStage2Frontend()
+    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc | p3cpp | p3cond | p4 | p5 | p6 | p7ar | p7gpu | p7quant | stage2)")
     }
 } catch {
     fail("\(error)")
