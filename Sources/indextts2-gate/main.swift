@@ -1264,6 +1264,128 @@ func gateP7GPU() throws {
     print("P7-GPU GATE PASSED")
 }
 
+// MARK: - P7 gate: quantization (int8 + int4 on the GPT transformer Linears)
+
+// Scope mirrors the donor (`nn.quantize(self.gpt.gpt, bits, group_size=64)`): ONLY the
+// GPT2 backbone Linears (gpt.h.*); embeddings / heads / final norms / conditioners /
+// S2Mel / vocoder stay fp32|fp16. ⚠ Quantized matmul is Metal-only: load + quantize run
+// on the CPU stream, every FORWARD runs on the GPU stream (a CPU-pinned quant forward
+// silently grinds for hours). The ~1e-3 GPU-vs-golden fp32 noise is absorbed by the
+// cosine gates: gpt_latent int8 ≥ 0.9999, int4 ≥ 0.99, + e2e WAV validity + memory delta.
+func gateP7Quant() throws {
+    func mb(_ bytes: Int) -> String { String(format: "%.0f MB", Double(bytes) / 1_048_576) }
+
+    let conditioning = try NPY.load(goldensDir.appending(path: "core_gpt_conditioning.npy")).asType(.float32)
+    let textTokens = try NPY.load(goldensDir.appending(path: "core_gpt_latent__in0.npy"))
+    let melCodes = try NPY.load(goldensDir.appending(path: "core_gpt_latent__in1.npy"))
+    let goldenLatent = try NPY.load(goldensDir.appending(path: "core_gpt_latent.npy")).asType(.float32)
+
+    // fp32 downstream chain (unquantized scope), loaded once on the CPU stream.
+    print("→ loading fp32 S2Mel + Vq2Emb + BigVGAN (CPU stream; quant scope excludes them)")
+    let (s2mel, bigvgan, vq2emb) = try Device.withDefaultDevice(Device(.cpu)) {
+        () -> (S2Mel, BigVGANV2, Vq2Emb) in
+        let s2mel = try loadS2Mel()
+        let bigvgan = try loadBigVGAN()
+        let vq2emb = Vq2Emb()
+        let raw = try loadArrays(url: weightsDir.appending(path: "vq2emb.safetensors"))
+        try vq2emb.update(
+            parameters: ModuleParameters.unflattened(
+                Vq2Emb.sanitize(raw).mapValues { $0.asType(.float32) }),
+            verify: .all)
+        eval(vq2emb)
+        return (s2mel, bigvgan, vq2emb)
+    }
+    let refMel = try NPY.load(goldensDir.appending(path: "frontend_ref__ref_mel.npy")).asType(.float32)
+    let promptCondition = try NPY.load(goldensDir.appending(path: "frontend_ref__prompt_condition.npy")).asType(.float32)
+    let style = try NPY.load(goldensDir.appending(path: "frontend_ref__style.npy")).asType(.float32)
+
+    for (bits, cosMin) in [(8, Float(0.9999)), (4, Float(0.99))] {
+        print("→ int\(bits): load fp32 + quantize gpt.h.* Linears (CPU stream)")
+        var residentBefore = 0
+        var residentAfter = 0
+        let model = try Device.withDefaultDevice(Device(.cpu)) { () -> UnifiedVoiceV2 in
+            let m = try loadUnifiedVoiceV2()
+            residentBefore = Memory.activeMemory
+            quantize(model: m, groupSize: 64, bits: bits) { path, module in
+                path.hasPrefix("gpt.h.") && module is Linear
+            }
+            eval(m)
+            return m
+        }
+        Memory.clearCache()
+        residentAfter = Memory.activeMemory
+        let nQuantized = model.leafModules().flattened().filter { $0.1 is Quantized }.count
+        print("  quantized \(nQuantized) Linears; resident \(mb(residentBefore)) → \(mb(residentAfter))"
+              + " (Δ \(mb(residentBefore - residentAfter)))")
+
+        // --- teacher-forced gpt_latent (GPU forward) ---
+        var start = Date()
+        let latent = model.forwardLatent(
+            conditioning: conditioning, textTokens: textTokens, melCodes: melCodes)
+        eval(latent)
+        let cos = cosine(latent, goldenLatent)
+        print(String(format: "  gpt_latent cos=%.7f max_abs=%.5f (%.2fs, GPU)",
+                     cos, maxAbsDiff(latent, goldenLatent), Date().timeIntervalSince(start)))
+        guard cos >= cosMin else {
+            fail(String(format: "int%d gpt_latent cos %.7f < %.4f", bits, cos, cosMin))
+        }
+
+        // --- seeded AR + e2e WAV validity (GPU forwards) ---
+        MLXRandom.seed(42)
+        start = Date()
+        let sampled = model.generateMelCodes(
+            conditioning: conditioning, textTokens: textTokens, maxMelTokens: 600,
+            temperature: 0.8, topK: 30, topP: 0.8, repetitionPenalty: 10.0)
+        print(String(format: "  sampled(seed 42): %d raw tokens, stopped=%@ (%.1fs, %.0f ms/token)",
+                     sampled.melCodes.count, String(sampled.stopped),
+                     Date().timeIntervalSince(start),
+                     1000 * Date().timeIntervalSince(start) / Double(sampled.melCodes.count + 1)))
+        guard sampled.stopped, (20 ... 600).contains(sampled.melCodes.count) else {
+            fail("int\(bits) sampled run invalid (stopped=\(sampled.stopped), n=\(sampled.melCodes.count))")
+        }
+        let codes = compressSilence(sampled.melCodes)
+        let codesArr = MLXArray(codes.map(Int32.init)).reshaped(1, codes.count)
+
+        let qLatent = model.forwardLatent(
+            conditioning: conditioning, textTokens: textTokens, melCodes: codesArr)
+        let sInfer = vq2emb(codesArr).transposed(0, 2, 1) + s2mel.gptLayerModule(qLatent)
+        let cond = s2mel.lengthRegulatorModule(
+            sInfer, ylens: MLXArray([Int32(Float(codes.count) * 1.72)]))
+        let catCondition = concatenated([promptCondition, cond], axis: 1)
+        let mel = s2mel.cfmModule.inference(
+            mu: catCondition, xLens: MLXArray([Int32(catCondition.dim(1))]),
+            prompt: refMel, style: style,
+            nTimesteps: 25, temperature: 1.0, inferenceCfgRate: 0.7)
+        let wav = bigvgan(mel[0..., 0..., refMel.dim(2)...])
+        eval(wav)
+
+        var audio = wav[0, 0]
+        let peak = MLX.abs(audio).max().item(Float.self)
+        if peak > 1.0 { audio = audio / max(peak, 1e-6) }
+        audio = clip(audio, min: -0.99, max: 0.99)
+        eval(audio)
+        let rms = sqrt(mean(audio * audio)).item(Float.self)
+        let dbfs = 20 * log10(max(rms, 1e-12))
+        print(String(format: "  e2e: %d samples (%.2fs)  RMS=%.4f  dBFS=%.1f",
+                     audio.dim(0), Float(audio.dim(0)) / 22050.0, rms, dbfs))
+        guard dbfs > -35 && dbfs < -10 else {
+            fail(String(format: "int%d dBFS %.1f outside (−35, −10)", bits, dbfs))
+        }
+
+        var samples = [Float](repeating: 0, count: audio.dim(0))
+        for i in 0 ..< audio.dim(0) { samples[i] = audio[i].item(Float.self) }
+        let wavURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appending(path: "PORTING/p7_int\(bits)_seed42.wav")
+        try writeWAV(samples, sampleRate: 22050, to: wavURL)
+        print("  wrote \(wavURL.path)")
+        print(String(format: "  peak(GPU forwards)=%@", mb(Memory.peakMemory)))
+        Memory.clearCache()
+        print("  int\(bits) PASSED")
+    }
+
+    print("P7-QUANT GATE PASSED")
+}
+
 // MARK: - Entry
 
 let mode = CommandLine.arguments.dropFirst().first ?? "p2"
@@ -1280,7 +1402,8 @@ do {
     case "p6": try gateP6()
     case "p7ar": try gateP7AR()
     case "p7gpu": try gateP7GPU()
-    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc | p3cpp | p3cond | p4 | p5 | p6 | p7ar | p7gpu)")
+    case "p7quant": try gateP7Quant()
+    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc | p3cpp | p3cond | p4 | p5 | p6 | p7ar | p7gpu | p7quant)")
     }
 } catch {
     fail("\(error)")
