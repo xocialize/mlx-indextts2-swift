@@ -43,10 +43,10 @@ public struct IndexTTS2Configuration: PackageConfiguration, ModelStorable, Quant
     public var availableBudgetBytes: UInt64?
 
     public init(
-        repo: String = "vanch007/mlx-indextts2-standard-fp16",
+        repo: String = "mlx-community/IndexTTS-2-fp16",
         revision: String? = nil,
-        w2vBertRepo: String = "facebook/w2v-bert-2.0",
-        semanticCodecRepo: String = "amphion/MaskGCT",
+        w2vBertRepo: String = "mlx-community/IndexTTS-2-fp16",
+        semanticCodecRepo: String = "mlx-community/IndexTTS-2-fp16",
         quant: Quant = .fp16,
         modelDirectory: URL? = nil,
         w2vBertDirectory: URL? = nil,

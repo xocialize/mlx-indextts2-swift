@@ -52,9 +52,9 @@ final class MaterializationTests: XCTestCase {
     func testDeclaresThreeSourcesQuantInvariant() {
         let fp16 = IndexTTS2Configuration().weightSources
         XCTAssertEqual(fp16.map(\.role), ["main", "w2v-bert", "semantic-codec"])
-        XCTAssertEqual(fp16[0].repo, "vanch007/mlx-indextts2-standard-fp16")
+        XCTAssertEqual(fp16[0].repo, "mlx-community/IndexTTS-2-fp16")
         XCTAssertEqual(fp16[0].matching, IndexTTS2Configuration.mainFiles)
-        XCTAssertEqual(fp16[1].repo, "facebook/w2v-bert-2.0")
+        XCTAssertEqual(fp16[1].repo, "mlx-community/IndexTTS-2-fp16")
         XCTAssertEqual(fp16[2].matching, ["semantic_codec/model.safetensors"])
         // Quant tiers quantize in-memory at load — the materialization set never changes.
         let int4 = IndexTTS2Configuration(quant: .int4).weightSources
@@ -102,11 +102,11 @@ final class MaterializationTests: XCTestCase {
         let cfg = IndexTTS2Configuration(modelsRootDirectory: root)
         let paths = cfg.prewarmPaths.map(\.path)
         XCTAssertTrue(paths.contains(
-            root.appending(path: "vanch007/mlx-indextts2-standard-fp16/gpt.safetensors").path))
+            root.appending(path: "mlx-community/IndexTTS-2-fp16/gpt.safetensors").path))
         XCTAssertTrue(paths.contains(
-            root.appending(path: "facebook/w2v-bert-2.0/model.safetensors").path))
+            root.appending(path: "mlx-community/IndexTTS-2-fp16/model.safetensors").path))
         XCTAssertTrue(paths.contains(
-            root.appending(path: "amphion/MaskGCT/semantic_codec/model.safetensors").path))
+            root.appending(path: "mlx-community/IndexTTS-2-fp16/semantic_codec/model.safetensors").path))
     }
 
     func testCodableRoundTrip() throws {
