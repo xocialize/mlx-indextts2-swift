@@ -192,6 +192,13 @@ extension UnifiedVoiceV2 {
         var stopped = false
 
         for i in 0 ..< maxMelTokens {
+            // Cooperative cancellation bail (MLXEngine CAN gate): sync code running on the
+            // caller's Task sees the flag once per generated mel token — the GPT-backbone
+            // autoregressive cadence. Non-throwing public API by design; the caller
+            // (synthesize's post-AR cancelCheck / the engine package) surfaces the
+            // CancellationError and discards the partial codes.
+            if Task.isCancelled { break }
+
             let step: (MLXArray, MLXArray, [(MLXArray, MLXArray)])
 
             if cache == nil {

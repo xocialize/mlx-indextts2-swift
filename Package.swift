@@ -28,8 +28,10 @@ let package = Package(
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
         // Shared STFT/mel primitives.
         .package(url: "https://github.com/xocialize/mlx-audio-dsp.git", from: "0.1.0"),
-        // Engine contract (≥0.23.0 = LicenseRef-Index-Model + emotionControl/durationControl).
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.23.0"),
+        // Engine contract — ≥0.27.0 for the CAN cancellation-conformance gate
+        // (MLXServeConformance.CancellationConformance); 0.23.0 brought
+        // LicenseRef-Index-Model + emotionControl/durationControl.
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.27.0"),
         // Native downloader for WeightSourcing auto-materialization.
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
     ],

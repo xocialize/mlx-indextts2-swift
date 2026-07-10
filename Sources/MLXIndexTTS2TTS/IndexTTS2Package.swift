@@ -153,11 +153,16 @@ public final class IndexTTS2Package: ModelPackage {
     // MARK: - Run
 
     public func run(_ request: any CapabilityRequest) async throws -> any CapabilityResponse {
+        // CAN-1: the entry checkpoint is the FIRST act of run() — before notLoaded validation
+        // (engine ≥ 0.27.0). Mid-run cadence: the GPT AR loop bails per generated mel token
+        // (`Task.isCancelled` break in generateMelCodes), and the throwing `cancelCheck`
+        // closure passed to synthesize() below checkpoints between every pipeline stage
+        // (per-segment AR / S2Mel / CFM / BigVGAN), rethrowing CancellationError unchanged.
+        try Task.checkCancellation()
         guard let generator else { throw PackageError.notLoaded }
         guard request.capability == .tts, let tts = request as? TTSRequest else {
             throw PackageError.unsupportedCapability(request.capability)
         }
-        try Task.checkCancellation()
 
         // Voice: zero-shot cloning only.
         guard case .referenceAudio(let referenceClip) = tts.voice.selection else {

@@ -302,6 +302,10 @@ public final class IndexTTS2Generator {
             let codes = compressSilence(result.melCodes)
             if !codes.isEmpty { generated.append((ids: ids, codes: codes)) }
         }
+        // Cancellation must win over emptyGeneration: a per-token bail inside generateMelCodes
+        // (CAN gate) can leave `generated` empty/partial — surface the CancellationError
+        // unchanged here rather than laundering it into IndexTTS2Error.emptyGeneration.
+        try cancelCheck?()
         guard !generated.isEmpty else { throw IndexTTS2Error.emptyGeneration }
 
         // Length-regulator targets (the E12 duration lever).
