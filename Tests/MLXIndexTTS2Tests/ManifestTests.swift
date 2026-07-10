@@ -35,9 +35,9 @@ final class ManifestTests: XCTestCase {
             XCTAssertGreaterThan(footprint.peakActivationBytes, 0)          // split declared
         }
         XCTAssertEqual(manifest.requirements.requiredBackends, [.metalGPU])
-        // C6: the two E12 control-plane specialties.
+        // C6: zero-shot cloning selection axis + the two E12 control-plane specialties.
         XCTAssertEqual(Set(manifest.specialties.map(\.specialty)),
-                       [.emotionControl, .durationControl])
+                       [.voiceClone, .emotionControl, .durationControl])
         // C11: descriptor is well-formed.
         let surface = manifest.surfaces[0]
         XCTAssertEqual(surface.capability, .tts)

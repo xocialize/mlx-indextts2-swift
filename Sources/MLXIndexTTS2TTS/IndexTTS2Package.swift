@@ -67,6 +67,7 @@ public final class IndexTTS2Package: ModelPackage {
                 chipFloor: nil
             ),
             specialties: [
+                SpecialtyWeight(.voiceClone, strength: 1.0),
                 SpecialtyWeight(.emotionControl, strength: 1.0),
                 SpecialtyWeight(.durationControl, strength: 1.0),
             ],
