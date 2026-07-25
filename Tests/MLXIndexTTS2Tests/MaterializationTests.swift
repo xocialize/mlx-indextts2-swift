@@ -70,10 +70,12 @@ final class MaterializationTests: XCTestCase {
         let cfg = IndexTTS2Configuration()
         // Empty store: everything missing.
         XCTAssertEqual(cfg.missingWeightSources(storeRoot: root).count, 3)
-        // Populate the expected layout.
-        let mainDir = root.appending(path: cfg.repo)
-        let w2vDir = root.appending(path: cfg.w2vBertRepo)
-        let codecDir = root.appending(path: cfg.semanticCodecRepo)
+        // Populate the expected layout — paths from ModelStore so the fixture tracks the
+        // engine's canonical models--org--name layout (contract 1.22.0) instead of a stale literal.
+        let store = ModelStore(root: root)
+        let mainDir = store.directory(for: cfg.repo)!
+        let w2vDir = store.directory(for: cfg.w2vBertRepo)!
+        let codecDir = store.directory(for: cfg.semanticCodecRepo)!
         try FileManager.default.createDirectory(at: mainDir, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: w2vDir, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(
@@ -101,12 +103,15 @@ final class MaterializationTests: XCTestCase {
         let root = URL(fileURLWithPath: "/tmp/some-store")
         let cfg = IndexTTS2Configuration(modelsRootDirectory: root)
         let paths = cfg.prewarmPaths.map(\.path)
+        // Expectations from ModelStore, not literals — the layout is the engine's to define.
+        let store = ModelStore(root: root)
         XCTAssertTrue(paths.contains(
-            root.appending(path: "mlx-community/IndexTTS-2-fp16/gpt.safetensors").path))
+            store.directory(for: cfg.repo)!.appending(path: "gpt.safetensors").path))
         XCTAssertTrue(paths.contains(
-            root.appending(path: "mlx-community/IndexTTS-2-fp16/model.safetensors").path))
+            store.directory(for: cfg.w2vBertRepo)!.appending(path: "model.safetensors").path))
         XCTAssertTrue(paths.contains(
-            root.appending(path: "mlx-community/IndexTTS-2-fp16/semantic_codec/model.safetensors").path))
+            store.directory(for: cfg.semanticCodecRepo)!
+                .appending(path: "semantic_codec/model.safetensors").path))
     }
 
     func testCodableRoundTrip() throws {
