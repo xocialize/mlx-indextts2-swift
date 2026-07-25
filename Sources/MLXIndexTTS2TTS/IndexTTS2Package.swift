@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXNN
 import MLXIndexTTS2
 import MLXRandom
 import MLXToolKit
@@ -87,6 +88,14 @@ public final class IndexTTS2Package: ModelPackage {
 
     private let configuration: Configuration
     private var generator: IndexTTS2Generator?
+
+    /// Test-facing seam for the engine's **INF gate** (C14): the loaded component graphs, keyed by
+    /// role. Reached via `@testable`; the `InferenceModeInspectable` conformance lives in the test
+    /// target so the shipping target takes no dependency on the conformance library. `nil` before
+    /// `load()`, so an unloaded package reports an empty graph — which INF-1 fails, by design.
+    /// `campplus` is the BatchNorm carrier; the rest are in scope so a future training-mode-
+    /// sensitive layer cannot slip in unwatched.
+    var inferenceModeGraphs: [String: MLXNN.Module?] { generator?.inferenceModeGraphs ?? [:] }
     // Reference-conditioning reuse (the Qwen3 E1 pattern): long-form/dub synthesis sends the
     // SAME reference for every line; preparing it re-runs w2v-BERT + RepCodec + CampPlus +
     // ref-mel + length regulator. Memoize keyed by the reference bytes. Safe to hold:

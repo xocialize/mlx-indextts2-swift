@@ -66,6 +66,15 @@ public final class IndexTTS2Generator {
     /// GPT-backbone quant applied at load (nil = as-shipped fp16).
     public let quantBits: Int?
 
+    /// Test-facing seam for the engine's **INF gate** (C14): every loaded component, keyed by role.
+    /// Public because the engine wrapper lives in a separate module (MLXIndexTTS2TTS) and the
+    /// components are internal here. `campplus` is the BatchNorm carrier; the rest are in scope so
+    /// a future training-mode-sensitive layer cannot slip in unwatched.
+    public var inferenceModeGraphs: [String: MLXNN.Module?] {
+        ["gpt": gpt, "s2mel": s2mel, "bigvgan": bigvgan, "vq2emb": vq2emb,
+         "w2v": w2v, "repcodec": repcodec, "campplus": campplus]
+    }
+
     // MARK: - Loading
 
     private init(gpt: UnifiedVoiceV2, s2mel: S2Mel, bigvgan: BigVGANV2, vq2emb: Vq2Emb,
@@ -94,7 +103,10 @@ public final class IndexTTS2Generator {
     }
 
     /// Load one component with the full weight-key contract (0-missing / 0-unused).
-    private static func loadComponent<M: Module>(
+    ///
+    /// Internal rather than private so the C14 INF gate can exercise this choke point directly —
+    /// it is where inference mode is set for all seven components.
+    static func loadComponent<M: Module>(
         _ model: M, url: URL, sanitize: ([String: MLXArray]) -> [String: MLXArray]
     ) throws -> M {
         guard FileManager.default.fileExists(atPath: url.path) else {
@@ -111,6 +123,19 @@ public final class IndexTTS2Generator {
                 + "(\(unused.sorted().prefix(4)))")
         }
         try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: .all)
+
+        // INFERENCE MODE — load-bearing, not hygiene (engine C14 / the INF gate).
+        // `MLXNN.Module.training` defaults to `true`, and in that state `BatchNorm` normalizes by
+        // the CURRENT batch's statistics and *overwrites* the checkpoint's
+        // `running_mean`/`running_var` on every forward (MLXNN/Normalization.swift:
+        // `if self.training, let runningMean, let runningVar`). CAMPPlus — the speaker encoder
+        // whose embedding conditions the whole clone — is dense with BatchNorms (`batchnorm`,
+        // `bn`, `bn1`, `bn2` across TDNN/CAMDense/FSMN blocks), so without this the speaker
+        // embedding is computed from the reference clip's own statistics and drifts run to run.
+        // All seven components load through here, so this is the one choke point — call sites
+        // deliberately do NOT repeat it. (The `indextts2-gate` parity harness loads inline, on its
+        // own path, and sets it there.)
+        model.train(false)
         eval(model)
         return model
     }
@@ -174,9 +199,10 @@ public final class IndexTTS2Generator {
                 url: semanticCodecDirectory.appending(path: "semantic_codec/model.safetensors"),
                 sanitize: RepCodec.sanitize)
             tick()
+            // loadComponent leaves every component in inference mode (CAMPPlus's BatchNorms must
+            // read running stats) — it is the choke point, so no train(false) here.
             let campplus = try loadComponent(
                 CAMPPlus(), url: campplusURL, sanitize: CAMPPlus.sanitize)
-            campplus.train(false)  // BatchNorms use running stats
             tick()
 
             return IndexTTS2Generator(

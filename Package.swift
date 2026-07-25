@@ -32,7 +32,7 @@ let package = Package(
         // cloning selection axis); 0.27.0 brought the CAN cancellation-conformance gate
         // (MLXServeConformance.CancellationConformance); 0.23.0 brought
         // LicenseRef-Index-Model + emotionControl/durationControl.
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.28.1"),
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.36.0"),
         // Native downloader for WeightSourcing auto-materialization.
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
     ],
@@ -73,7 +73,9 @@ let package = Package(
             dependencies: [
                 "MLXIndexTTS2",
                 "MLXIndexTTS2TTS",
+                .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXServeConformance", package: "mlx-engine-swift"),
+                .product(name: "MLXServeConformanceNN", package: "mlx-engine-swift"),  // INF gate
             ],
             resources: [.copy("Resources")]
         ),
