@@ -1,288 +1,78 @@
-# mlx-indextts2-swift — porting spec & phase gates
+# mlx-indextts2-swift — porting spec & gates (IndexTTS-2.5, v0.4.0)
 
-Swift-MLX port of IndexTTS2. Donor: `solar2ain/mlx-indextts` (MIT, Python-MLX) + our verified
-MLX-Python front-end ports (w2v-BERT 2.0, MaskGCT RepCodec) in `~/Development/_indextts2-oracle/`.
-Plan of record: `mlxengine-audio/Docs/IndexTTS2-Swift-Port-Plan.md`. Every phase gates against the
-Stage-0 goldens (`_indextts2-oracle/goldens/`, 23 files + manifest; seed=42 tuple).
+Swift-MLX port of **IndexTTS-2.5**. Donor / oracle: `vanch007/mlx-indextts2` (MIT, Python-MLX,
+`--profile v25`, converter rev `4a32c967`) over the released checkpoint `IndexTeam/IndexTTS-2.5`
+rev `d0aa86e75bb6f3437f3831e95056fa72842d89ef`. The upstream PyTorch reference (`index-tts`
+`infer_v2_5.py`, `gpt/model_v2_5.py`, `codec/models.py`) was read line by line for every delta;
+the donor is the numeric oracle because it is the MLX-native reference the Swift port mirrors
+op-for-op (the 2.0 port followed the same doctrine with solar2ain's donor).
 
-## Phase table
+Goldens: `PORTING/goldens-v25/` (11 MB, in-repo for durability — the 2.0 oracle workspace
+outside the repo did not survive), captured by `WIP/indextts25/tools/capture_v25_goldens.py`
+(fp32, CPU, deterministic; reference clip = the Studio's `indextts2-ref.wav`, 48 kHz → 5.0 s;
+golden sentence "The quick brown fox jumps over the lazy dog, and the afternoon light settles
+quietly on the river."; seed 42 for the CFM noise). `manifest.json` records the tuple.
 
-| Phase | Surface | Gate | Status |
+## History
+
+- **v0.1–v0.3 (2026-07):** IndexTTS-2.0 port (P1–P7 + Stage 2), non-commercial weights,
+  eval-acknowledged license gate. Superseded and REMOVED at v0.4.0 (RepCodec/MaskGCT, vq2emb,
+  gpt_layer use, SentencePiece tokenizer, speaker Conformer/Perceiver, speed embedding, the
+  three-source weight layout). The 2.0 phase table lives in git history (tag v0.3.0).
+- **v0.4.0 (2026-09-02):** IndexTTS-2.5 — this document.
+
+## The 2.5 delta (what was ported)
+
+| # | Surface | Reference | Swift |
 |---|---|---|---|
-| P1 | tokenizer + normalize (`Text/`) | bit-exact ids/pieces/normalized vs oracle over 13-fixture corpus incl. golden sentence (17 ids) | **PASSED 2026-07-08** (6/6 tests) |
-| P2 | GPT AR (text→semantic) | teacher-forced `gpt_latent` vs golden, cos ≥0.999 fp32 CPU | **PASSED 2026-07-08** (cos 0.9999995, max_abs 0.031; 301-key subset contract 0-missing/0-unused) |
-| P3a | fbank heads (Seamless w2v-BERT FE + CampPlus kaldi) on `mlx-audio-dsp` | vs HF `SeamlessM4TFeatureExtractor` / `torchaudio.compliance.kaldi.fbank` goldens (ref + synth) | **PASSED 2026-07-08** (`p3fe`: fbank cos 1.0000000, input_features 0.9999999 max_abs 1.2e-4, mask 249 exact) |
-| P3b | conditioner models: w2v-BERT Conformer + MaskGCT + CampPlus + conformer/perceivers | per-embed goldens (`spk_cond_emb`, `S_ref`, `style`, `emovec`) | **PASSED 2026-07-08** (`p3w2v` hs-ladder ≤1.93e-04, tap 1.85e-05, FE-chain cos 1.0; `p3mgc` codes 250/250 exact, S_ref 9.5e-07; `p3cpp` ladder ≤4.6e-05, style 5.0e-06; `p3cond` speech_cond/base_emovec/conditioning cos ≥0.999999) |
-| P4 | S2Mel CFM + length regulator | `cfm_mel` golden (seed-42 replay set) | **PASSED 2026-07-08** (`p4`: gptlayer cos 1.0000002, lenreg max_abs 0.0 BITWISE, dit_step1 cos 1.0000005, cfm_mel cos 0.9999999 over 25 steps; 264-key contract 0-missing/0-unused; seeded-normal cross-binding max_abs 4.8e-7) |
-| P5 | BigVGAN2 vocoder | `bigvgan_wav` golden + listen | **PASSED 2026-07-08** (`p5`: wav(seed42) cos 0.9995050 / wav(orig) cos 0.9995069 — equals the Python reference's own CPU-vs-Metal floor (0.9995355); 449-key contract; all anti-alias primitive probes ≤7.4e-3) |
-| P6 | e2e | Stage-0 WAV, quantified (dBFS/RMS, not ears) | **PASSED 2026-07-08** (`p6`: 12 native stages, all ≥0.9999970; e2e audio RMS 0.0711/−23.0 dBFS vs golden 0.0695/−23.2; wav cos 0.9786 = inside BigVGAN's inherent chaos band (python itself: 0.9945 @9e-4 mel perturb); \|STFT\| cos 0.9998; WAV at PORTING/p6_e2e_seed42.wav) |
-| P7 | AR sampling + GPU smoke + quant | (a) greedy token-exact + step-0 logits ≥0.9999 vs fp32-CPU oracle capture; (b) full chain on GPU stream, stages ≥0.999 + \|STFT\| ≥0.999; (c) int8/int4 gpt_latent ≥0.9999/≥0.99 + e2e validity (forwards GPU-only) | **PASSED 2026-07-09** (`p7ar`: greedy 114/114 EXACT, step-0 logits cos 0.9999999, sampled(42) 111 tokens → −23.3 dBFS; `p7gpu`: all stages ≥0.9995, GPU greedy 114/114, \|STFT\| 0.9997976, pure-vocode raw 0.9999903; `p7quant`: int8 0.9999846 / int4 0.9952125, both e2e valid) |
-| Stage 2 | engine wrap (contract + runtime + harness) | ref-mel/emovec debts vs goldens; MAT-1..5 + manifest offline; self-contained production run; MLXServeEngine in-app: license gate + prepare/run timed + footprints + listen WAVs | **COMPLETE 2026-07-09** (`stage2` refmel cos 0.9999999/emovec bitwise; `stage2e2e` fp16 4475 MB, targetDuration 3.00 s EXACT; in-app: NC gate fires, materialization ~6.6 GB → prepare 321 s, runs 20.8/7.4/6.2 s, phys floor 4.76 / peak 9.61 GB, post-evict 0.37 GB) |
+| D1 | tiktoken byte-level BPE + Whisper special table (60 509) | `utils/tokenizer.py get_encoding` | `Text/TiktokenBPE.swift` (own `byte_pair_merge`; vocab read from the weight dir; the `=` empty-token line is accepted) |
+| D2 | text pipeline: CHAR_REP_MAP → zh/en normalize → case rule → `<word\|pron>` → ja spacing → `<\|XX\|>` → token-budget split → `<\|lang\|> ` prefix + stop 1 | `infer_v2_5.py infer`, `split_text_by_tokens`, `apply_pronunciation_annotations`, `ja_g2p.py` | `Text/TextFrontendV25.swift` (+ `Normalize.swift` gains `applyBaseCharRepMap`) |
+| D3 | `spk_emb_proj` (192→1280) + `lang_embedding` (107); conds = `[spk+emo, 0, 0]`; text emb += lang emb | `gpt/model_v2_5.py` | `Models/UnifiedVoiceV25.swift` (emotion conditioner + AR sampler carried from 2.0) |
+| D4 | EnhancedCodec DECODE: FVQ codebook+out_project → VocosBackbone(384, ff 2048, ×12 ConvNeXt) → Linear(384→1024) → nearest ×2 → `up` Conv1d k3 | `codec/models.py`, `codec/kmeans/vocos.py`, `amphion_codec/quantize` | `Models/EnhancedCodec.swift` (encoder half dropped in `sanitize`, 0-missing/0-unused otherwise) |
+| D5 | prompt_condition = length_regulator(raw w2v-BERT features); target = `len(S_infer)·1.72·duration_factor`; no gpt_layer | `infer_v2_5.py` 620–840 | `IndexTTS2Generator.swift` (S2Mel module keeps `gpt_layer` params for the key contract, never calls them) |
+| D6 | engine surface: 2 weight sources in one repo, `language` metaData, allowlisted license | — | `MLXIndexTTS2TTS/*` |
 
-## P1 notes (banked)
+Unchanged and re-gated against fresh goldens: Seamless fbank + w2v-BERT tap, CAMPPlus, ref-mel,
+emotion conditioner (Conformer + 1-latent Perceiver), EmotionPresets (feat1/feat2 are
+byte-identical to 2.0's baked copies — verified), length regulator, CFM/DiT/WaveNet, BigVGAN v2.
 
-- **SP model is Unigram** (not BPE): 12k pieces, `nmt_nfkc`, `add_dummy_prefix`,
-  `remove_extra_whitespaces`, no byte_fallback, unk_id=2. Swift impl = protobuf-free: the
-  conversion dumps `(piece, score, type)` JSON (`_indextts2-oracle/tools/dump_tokenizer.py`) and
-  `SentencePieceUnigram.swift` runs trie+Viterbi (unk = minScore−10, SP `kUnkPenalty`;
-  adjacent unks merge into one piece — verified: "42" → single `<unk>`).
-- **wetext (number/date normalization) is a NO-OP in the oracle install** — digits pass through
-  and tokenize to `<unk>` ("3", "42" → id 2). Parity target = oracle-as-run, so the Swift port has
-  no wetext equivalent. **Upstream quality gap:** for dub text, pre-normalize numbers upstream
-  (or add post-parity behind a flag). Do NOT "fix" this inside the parity path.
-- **CHAR_REP_MAP carries an upstream source bug we reproduce verbatim:** the smart-quote dict
-  entries collapsed into one garbage multi-char key, so `“ ”` are NOT mapped. The effective
-  33-entry ordered map was dumped from the running Python; replacement = single left-to-right
-  pass, first-matching key in map order.
-- Encode pipeline: `TextNormalizer.normalize` → `tokenize_by_cjk_char` (CJK spacing + **UPPERCASE**,
-  vocab is uppercase) → SP encode. NFKC roundtrip quirk: normalizer maps `...`→`…`, then SP's
-  nmt_nfkc maps `…`→`...` (piece `'...'` exists).
-- ICU regex gotcha: `\u{4e00}` (Swift style) is invalid in NSRegularExpression — use `一`.
-- Fixtures/vocab live in `Tests/MLXIndexTTS2Tests/Resources/`; regenerate with the oracle venv
-  tool if the corpus grows.
+## Gate table
 
-## P2 notes (banked)
-
-- Port set = `models/gpt2.py` → `Models/GPT2.swift` + `models/gpt_v2.py` (P2 subset) →
-  `Models/UnifiedVoiceV2.swift` (embeddings, LearnedPositionEmbedding as `<name>.emb.weight`,
-  24×GPT2Block, final_norm/heads/speed_emb, `forwardLatent`). Conditioning golden INJECTED
-  (perceiver/conformer conditioners = P3; their weight families deferred via the
-  declared-subset contract in the gate).
-- Resolved config truths (config.yaml, not the dataclass defaults!): dim=1280, heads=20,
-  layers=24, max_mel=1815, max_text=600, cond_num=32 (+2 speed) — dataclass defaults say
-  1024/16/20/605/402 and are WRONG for this checkpoint (classic resolved-config pitfall).
-- Gate lane = `swift run indextts2-gate p2` (CLI, not XCTest, per metallib doctrine);
-  fp32 upcast materialized with `eval(model)` post-update (watchdog corollary).
-- Weight keys map 1:1 with `@ModuleInfo(key:)` (`c_attn`/`c_proj`/`ln_1`/`ln_2`/`h.N`/`ln_f`,
-  `final_norm`, `<pos>.emb.weight`) — no sanitize/remap needed (donor is already MLX layout).
-
-## P3b notes (banked)
-
-- **All four conditioner surfaces passed first-run** (the verified MLX-Python donors +
-  per-stage ladders did their job). Gates: `p3w2v`, `p3mgc`, `p3cpp`, `p3cond` — each does a
-  full key contract (0-missing/0-unused), a golden-injected ladder, and (where the Swift
-  front-end exists) a full audio→embedding chain.
-- **Files:** `Models/W2VBert.swift` (donor `w2vbert_mlx/w2vbert.py`), `Models/RepCodec.swift`
-  (donor `maskgct_mlx/repcodec.py`), `Models/CampPlus.swift` (direct translation of
-  solar2ain's vendored 3D-Speaker torch reference — dots-tts donor not on disk),
-  `Models/Conformer.swift` + `Models/Perceiver.swift` (donors solar2ain
-  `models/{conformer,perceiver}.py`), conditioning methods on `UnifiedVoiceV2`.
-- **Numeric-module-key pitfall (twice):** `ModuleParameters.unflattened` treats numeric path
-  segments as ARRAY indices — torch Sequential/ModuleList children exposed as `shortcut.0`,
-  `layers.N.0` cannot be Swift module keys "0"/"1". Remap in sanitize
-  (`shortcut.{0,1}`→`{conv,bn}`, perceiver `layers.N.{0,1}`→`layers.N.{attn,ff}`).
-- **F-order golden pitfall recurred:** several Stage-0 pipeline goldens (`frontend_ref__S_ref`,
-  `core_vq2emb`, 4 maskgct ladder files) were fortran-order; rewritten C-contiguous in place
-  (NPY.swift rejects F-order by design). Check `.flags['C_CONTIGUOUS']` when dumping.
-- **CampPlus:** weights converted `campplus_cn_common.bin` → `_indextts2-oracle/
-  campplus_cn_common.safetensors` (raw keys, minus num_batches_tracked) + 12-stage torch
-  ladder via `tools/dump_campplus.py` (recompute == pipeline golden exactly). BatchNorms run
-  in inference mode — `model.train(false)` before any forward. avg_pool1d(ceil_mode) in the
-  CAM seg-pooling divides the partial tail window by its TRUE length. FCM flatten is C-major:
-  NHWC `(B,F',T,C)` → transpose → `(B,T,C·F')`.
-- **Conditioner resolved configs** (config.yaml, not dataclass defaults): cond =
-  Conformer(1024→512, ff 2048, 8 heads, 6 blocks) + Perceiver(1280, ctx 512, 32 latents,
-  8 heads, mult 2); emo = Conformer(1024→512, ff 1024, 4 heads, 4 blocks) + Perceiver(1024,
-  ctx 512, 1 latent, 4 heads, mult 2). Perceiver FF inner = ⌊dim·mult·2/3⌋ (1706/1365 —
-  confirmed by w_1 shapes). No macaron in these conformers; rel_shift unused;
-  RelPositionalEncoding multiplies x by √dim and does NOT add pe.
-- **Emotion blend** (generate_v2): weights = parse("happy")·α → weight_sum 0.6 →
-  `emo_vec = emovec_mat + (1−0.6)·base_emovec`; emovec_mat comes from feat2.pt emo_matrix
-  (still oracle-side; port with the E12 param plane at Stage 2).
-- **P2 gate refactored** onto a shared `loadUnifiedVoiceV2()` full-model loader (the
-  declared-subset contract is retired — all 667 gpt.safetensors keys are now declared).
-
-## P4 notes (banked)
-
-- **The original `core_s2mel_cfm_mel` golden is NOT reproducible from seed(42)** — generate_v2
-  seeds once at start and the AR sampler's `mx.random.categorical` draws consume the global
-  stream before CFM's noise draw. P4/P6 gate against the **seed-42 replay goldens**
-  (`_indextts2-oracle/tools/dump_s2mel_replay.py`): seed(42) → `normal(1,80,621)` is the FIRST
-  draw, so both bindings reproduce it. Replay sanity: gpt_layer / length_regulator / bigvgan
-  recomputes are **bitwise identical** to the original goldens (Metal is run-to-run
-  deterministic here); seed-42 cfm_mel is statistically equivalent to the original (cos 0.996).
-- **Cross-binding RNG:** Swift `MLXRandom.seed(42)` → `normal` matches Python within
-  max_abs 4.8e-7 — same stream, tiny fp difference in the normal transform. Fine for
-  production; the parity gate injects the dumped z (`core_s2mel_cfm_z_seed42.npy`) to stay exact.
-- **Files:** `Models/S2Mel.swift` (+GPTLayer), `Models/CFM.swift`, `Models/DiT.swift`,
-  `Models/WaveNet.swift`, `Models/LengthRegulator.swift` — isomorphic to donor
-  `models/s2mel/{s2mel,cfm,dit,wavenet,length_regulator}.py`. VoxCPM's UnifiedCFM was donor
-  for loop idioms only (its math is the opposite 1→0/subtractive convention; key paths don't
-  match s2mel.safetensors → translate-not-lift).
-- **Sanitize remaps (numeric-Sequential pitfall again):** `length_regulator.model.{0,3,6,9}`→
-  `convs.N`, `.{1,4,7,10}`→`norms.N`, `.12`→`out_proj`; `adaLN_modulation.layers.1`→
-  `adaLN_modulation.linear`. Everything else is already donor-MLX layout (no conv transposes;
-  vanch007 pre-fused all weight norms).
-- **Checkpoint-buffer trap:** `t_embedder.freqs` is IN s2mel.safetensors (fp16) and overwrote
-  the donor's computed fp32 buffer at load — declared `@ParameterInfo` so Swift loads the same
-  values. The RoPE table is NOT in the checkpoint — plain non-Module class (donor ditto), keeps
-  it out of the key contract.
-- **Donor-over-torch quirks replicated:** SConv1d does symmetric REFLECT padding (torch WN
-  zero-pads; donor produced the goldens → donor wins); FinalLayer non-affine LayerNorm eps=1e-6;
-  paired/interleaved RoPE (reshape (...,D/2,2), not half-split); hand-rolled attention (no fast
-  SDPA); solve_euler returns the last step BEFORE prompt-region re-zeroing.
-- **Duration control (E12):** the length-regulator target length is the lever —
-  generate_v2 uses `int(code_len * 1.72)`; `InterpolateRegulator(x, ylens:)` keeps it an
-  explicit caller-chosen parameter.
-- Resolved config = donor constructor defaults, cross-checked vs checkpoint config.yaml
-  (only DiT block_size differs, 16384 vs 8192 — positions ≤621, inert; donor kept).
-
-## P5 notes (banked)
-
-- **Files:** `Models/BigVGANV2.swift` (AMPBlock1/2 + BigVGANV2) + `Models/Activations.swift`
-  (kaiser-sinc filter, Snake/SnakeBeta, UpSample1d/DownSample1d/Activation1d) — isomorphic to
-  donor `models/{bigvgan_v2,activations}.py`. bigvgan.safetensors loads with NO sanitize
-  (449 keys 1:1; vanch007 pre-fused weight norms; conv weights already MLX layout).
-- **NEW MLX-Swift PITFALL — shared-init parameter aliasing:** assigning ONE MLXArray instance
-  to two `@ParameterInfo` wrappers (SnakeBeta alpha/beta both = `initial`) makes update()
-  write both keys into the same array — last write wins, alpha silently gets beta's values.
-  Key contract AND `verify: .all` both pass. Symptom: gate cos ~0.05; ladder localized it in
-  one hop (probe_act 1.5e0 while manual-formula check was 1.6e-3). Always allocate distinct
-  init arrays per parameter.
-- **Anti-alias filters are computed, not checkpoint keys** — UpSample1d/DownSample1d are plain
-  non-Module classes (donor underscore-prefixes `_filter`); np.kaiser/i0 replicated in Double
-  then cast fp32. Depthwise (identical-filter, groups=C) convs = channel-fold into batch.
-- **Elementwise stage gating is miscalibrated for deep snake stacks:** fp32-CPU vs fp16-Metal
-  drift amplifies through 6 stages of oscillatory sin²(αx) (stage_3 max_abs ~2.0 with cos
-  0.994 — benign). The Python reference ITSELF diverges from its Metal golden by max_abs 0.026
-  / cos 0.9995 e2e on the CPU stream. Ladder = report-only localization; hard gate = final
-  waveform cosine (Swift landed at the reference's exact floor: 0.99950 vs 0.99954).
-- v2 config quirks: conv_post bias=False, final activation = clip(-1,1) not tanh,
-  snakebeta-with-logscale everywhere. Checkpoint = nvidia/bigvgan_v2_22khz_80band_256x
-  (rates 4,4,2,2,2,2 · kernels 8,8,4,4,4,4 · 1536→24ch · resblock kernels 3,7,11 × d 1,3,5).
-
-## P6 notes (banked)
-
-- **Full native chain green:** tokenizer → SeamlessFE → w2v-BERT → RepCodec (S_ref) →
-  CampPlus (style) → GPT conditioners + emotion blend → teacher-forced `forwardLatent`
-  (mel_codes golden injected; AR sampling = P7 scope) → gpt_layer + `Vq2Emb` (new tiny module,
-  vq2emb.safetensors = pre-fused codebook+out_project extract) + length regulator →
-  CFM (25 steps, injected seed-42 z) → BigVGAN v2 → peak-norm/clip → WAV.
-  Every stage cos ≥0.9999970 vs its golden; prompt_condition and S_ref bitwise-class.
-- **e2e waveform cosine is a CHAOTIC metric — calibrate before gating on it.** Native-chain
-  mel drift (cos 0.9999996, rel ~9e-4) → wav cos 0.9786 through the vocoder. The PYTHON
-  vocoder maps a 9e-4 relative mel perturbation to wav cos 0.9945 and 3e-3 → 0.96, so 0.979
-  is reference-class behavior, not a port defect. Perceptual domain confirms: |STFT| cos
-  0.999815, log|STFT| 0.999553, RMS within 0.2 dB. Gate = per-stage ≥0.999 + wav cos ≥0.97 +
-  dBFS within 1 dB.
-- **Remaining injected-golden boundaries (Stage-2/P7 debts):** (1) torch `mel_fn` 22.05 kHz
-  ref-mel head (n_fft 1024/hop 256/80 mel) — build on MLXAudioDSP for zero-shot cloning from
-  raw reference audio; (2) `emovec_mat` from feat2.pt emo_matrix (port with the E12 emotion
-  param plane); (3) audio_16k PCM decode/resample = media-bridge layer by design;
-  (4) AR sampling loop (`generate_step` top-k/top-p/repetition) = P7.
-- 16-bit PCM WAV writer lives in the gate CLI; output at `PORTING/p6_e2e_seed42.wav` (2.21 s).
-
-## P7 notes (banked)
-
-- **Files:** `Models/UnifiedVoiceV2+Generate.swift` — isomorphic port of gpt_v2.py
-  `prepare_inputs` / `generate_step` / `_apply_repetition_penalty` / `_sample` + the
-  generate_v2.py AR driver + generate.py `compress_silence`. Behavior-preserving
-  deviations: the repetition penalty's per-token one-hot loop is one vectorized
-  vocab-mask pass; the top-p unsort scatter uses native `putAlong` instead of the
-  donor's numpy round-trip (survivors are a prefix of the descending sort, identical
-  result). Oracle fixture tool: `_indextts2-oracle/tools/dump_ar_greedy.py` (fp32
-  upcast, CPU stream → goldens/ar/).
-- **Gate doctrine held:** sampled sequences are never gated token-exact across
-  backends. Greedy (temp 0, rep-penalty 10) fp32-CPU vs fp32-CPU IS token-exact:
-  114/114. Bonus observation: the seeded (42) sampled run reproduces the Stage-0
-  capture's shape (111 tokens, −23.3 vs −23.2 dBFS) — the Swift RNG stream tracks
-  Python's through `categorical`; and GPU greedy also matched the CPU capture 114/114.
-- **GPU smoke:** loads pinned CPU-stream, all forwards GPU. Raw waveform cosine is
-  chaos-dominated on GPU (0.9476) while the pure-vocode diagnostic (golden mel → GPU
-  vocoder) reads raw 0.9999903 — the vocoder is exact vs its Metal-fp16 golden; the
-  drift is upstream-mel amplification (P6 calibration). **GPU wav gate = |STFT|-mag
-  cos ≥0.999** (measured 0.9997976; helper `stftMagCosine` on MLXAudioDSP, new gate
-  dep) + raw-cos 0.90 structural floor + dBFS band.
-- **Quantization** (scope = donor's: `gpt.h.*` Linears only, 96 layers, group 64;
-  embeddings/heads/norms/conditioners/S2Mel/vocoder full precision): int8 gpt_latent
-  cos 0.9999846, int4 0.9952125; both sampled-AR e2e valid. Load+quantize CPU-stream,
-  forwards GPU-ONLY (quant matmul is Metal-only — a CPU-pinned quant forward grinds
-  silently for hours). Unused lever for Stage 2: keep-hi-precision in/out projections
-  if int4 needs a lift (int4 has 0.005 headroom over its 0.99 gate).
-- **Timings** (M-series, warm shader cache, GPU): AR ≈ 13 ms/token fp32, ≈ 10 ms/token
-  quantized; CFM 25 steps 0.90 s; BigVGAN 0.64 s; full chain ≈ 5 s for 2.2 s of audio.
-  CPU-stream AR ≈ 51 ms/token (gate lane only).
-
-## Footprints (measured 2026-07-09; Stage-2 split-footprint manifest inputs)
-
-On-disk weights (per-component, production dtypes as shipped):
-
-| component | file | size | dtype |
+| Gate | Lane | Target | Result (2026-09-02, M5 Max, release build) |
 |---|---|---|---|
-| GPT (UnifiedVoiceV2 incl. conditioners) | gpt.safetensors | 1652 MB | fp16 |
-| S2Mel (CFM/DiT/lenreg) | s2mel.safetensors | 198 MB | fp16 |
-| BigVGAN v2 | bigvgan.safetensors | 214 MB | fp16 |
-| vq2emb | vq2emb.safetensors | 0.15 MB | fp16 |
-| w2v-BERT 2.0 (front-end) | model.safetensors | 2214 MB | **fp32** (HF ships fp32; fp16 conversion = Stage-2 lever → ~1.1 GB) |
-| MaskGCT semantic codec | semantic_codec/model.safetensors | 169 MB | fp32 |
-| CampPlus | campplus_cn_common.safetensors | 27 MB | fp32 |
+| tok | XCTest + `indextts2-gate tok` | id-exact: 19 byte-level BPE strings; raw ids on the 15-text corpus; frontend segment ids for zh/en/ja/es/ar, pronunciation markup, 12-sentence split at budget 60 | **PASSED** — bpe 19/19, raw 15/15, frontend 12/15 id-exact (3 WeText digit fixtures listed as the gap; ja exact via NaturalLanguage spacing) |
+| ref | `ref` (fp32 CPU) | Seamless features, w2v tap, CAMPPlus fbank + style, ref-mel, LR prompt, base_emovec, spk_emb_proj, conditioning, emovec_mat/blend | **PASSED** — features 1.2e-4 · w2v tap cos 1.0 / 7.8e-5 · fbank 2.5e-4 · style 6.4e-6 · ref-mel 3.9e-5 · LR prompt / spk_emb_proj / conditioning / emovec_mat BITWISE · base_emovec 3.6e-7 · blend 6e-8 |
+| gpt | `gpt` (fp32 CPU) | input_emb exact (pad-row equivalence), teacher-forced logits cos ≥ 0.9999, step-0 logits, greedy rollout token-exact + natural stop | **PASSED** — input_emb BITWISE · teacher-forced cos 1.0000001 / 1.9e-5 · step-0 1.8e-5 · greedy **137/137 token-exact**, natural stop |
+| codec | `codec` (fp32 CPU) | vq2emb, S_infer | **PASSED** — vq2emb 4.8e-7 · S_infer cos 1.0000001 / 1.0e-5 |
+| s2mel | `s2mel` (fp32 CPU) | LR cond; seeded `normal` cross-binding; 25-step CFM mel; BigVGAN wav | **PASSED** — LR cond BITWISE · seeded z BITWISE · CFM mel (generated region) BITWISE · BigVGAN wav cos 0.9999999 / 3.6e-6 |
+| e2e | `e2e` (fp16 Metal) | fp16 greedy prefix vs fp32 golden; sampled utterance validity (dBFS, length); happy 0.6; targetDuration 3.0 s exact; speechRate 1.3; zh | **PASSED** — fp16 greedy prefix 96/137, stops at 139 · sampled 5.55 s / −26.3 dBFS · happy 5.67 s / −21.0 · targetDuration 3.0 → 3.00 s · speechRate 1.3 → 4.26 s (≈4.27) · zh 3.42 s / −27.2 dBFS |
+| quant | `quant` (Metal) | int8 logits cos ≥ 0.999, int4 ≥ 0.99; greedy stops; e2e valid | **PASSED** — int8 cos 0.999973 (5.58 s / −26.2 dBFS) · int4 cos 0.991873 (5.06 s / −26.4 dBFS); both stop |
+| footprint | `footprint [--bits 8\|4]` | MLX-active resident + run peak per tier → manifest | resident fp16 4457 / int8 4017 / int4 3781 MB; peak (15 s) 9250 / 8990 / 8743 MB ⇒ transient ≈ 4.8–5.0 GB → declared 4.6 / 4.2 / 3.9 GB + 5.1 GB |
+| offline | `swift test` | 23: tokenizer/frontend parity, manifest C0–C13 (weights allowlisted), MAT-1..5 (2 sources), CAN-1..3, INF | **23/23 green** |
 
-Measured process residents (gate lane = **fp32-upcast** weights; production fp16
-residents ≈ on-disk sizes above, re-measure with MemoryProbe at Stage 2):
+## Notes banked during the 2.5 port
 
-| configuration | resident (post-load) | GPU forward peak |
-|---|---|---|
-| full chain fp32 (all 7 components) | 6539 MB | 9157 MB (e2e incl. w2v-BERT/CFM/BigVGAN) |
-| core TTS fp32 (GPT+S2Mel+BigVGAN+vq2emb) | 4130 MB | 5782 MB (AR + S2Mel + vocoder e2e) |
-| core TTS, GPT backbone **int8** | 2837 MB (Δ −1293) | ~5.8 GB |
-| core TTS, GPT backbone **int4** | 2616 MB (Δ −1518) | ~5.8 GB |
-
-Notes: activation peak is dominated by CFM/BigVGAN fp32 activations, not the GPT —
-quantization moves residents, not the peak. Buffer-pool cache grew to ~16 GB over the
-full-chain run (engine ≥0.21.0 owns the cacheLimit at Stage 2; gates clearCache()
-between passes). fp16-resident + envelope-sized activation numbers for the manifest's
-`QuantFootprint` come from the Stage-2 MemoryProbe pass at production dtypes.
-
-## Stage 2 — engine integration (COMPLETE 2026-07-09)
-
-**All Stage-2 debts closed; package live-validated through MLXServeEngine.** Gates:
-`indextts2-gate stage2` (front-end debts) + `stage2e2e` (self-contained production runtime) +
-XCTest MAT-1..5/manifest suites + the MLXEngineAudio `INDEXTTS2_VALIDATE=1` in-app run.
-
-- **Injected-golden debts closed:** (1) 22.05 kHz ref-mel head (`Frontend/RefMel.swift` on
-  MLXAudioDSP; oracle recompute bitwise vs `frontend_ref__ref_mel`, Swift cos 0.9999999 /
-  max_abs 4.2e-5); (2) preset-emotion path (`Frontend/EmotionPresets.swift`; feat1/feat2
-  matrices baked, emovec_mat bitwise vs golden, per-category cosine speaker match verified).
-  Dump tool: `_indextts2-oracle/tools/dump_stage2.py` → `goldens/stage2/` (+ archived in
-  `PORTING/goldens-stage2/`).
-- **Contract:** `MLXIndexTTS2TTS` wrapper target — `IndexTTS2Configuration` (ModelStorable +
-  QuantConfigured fp16|int8|int4 + BudgetAware + WeightSourcing: main/vanch007 4-safetensors
-  glob, w2v-bert, semantic-codec — quant-invariant, tiers quantize in-memory at load) +
-  `IndexTTS2Package` (C7 `LicenseRef-Index-Model` NonCommercial `.permissiveOrAcknowledged` /
-  C8 Apache; `emotionControl`+`durationControl` specialties; tier-3 provenance pinned).
-  Engine-side additions (mlx-engine-swift, local commit): the license entry + the two
-  specialty terms. Checkpoint pickles Swift can't read (feat1/feat2, wav2vec2bert_stats,
-  campplus .bin→safetensors, tokenizer vocab) are BAKED package resources — move to the
-  weight repo at the own-conversion re-publish.
-- **Runtime:** core `IndexTTS2Generator` (engine-free generate_v2 driver; as-shipped dtypes —
-  fp16 main/fp32 front-end, the reference's own production dtypes; CPU-stream loads,
-  GPU forwards; per-segment clearCache). E12 metaData plane on `run(_:)`: `emotion`
-  (name/weighted-list/8-vector), `emoAlpha`, `targetDuration` (native lenreg fit),
-  `speechRate`, `seed` (32-bit clamp). Reference-prep memoized per clip (Qwen3 E1 pattern).
-- **In-app validation (MLXEngineAudio, engine-driven):** `.permissiveOnly` REJECTS naming
-  the weight layer; acknowledged engine admits. First-run auto-materialization downloaded all
-  3 sources into the container store (prepare 321.3 s incl. ~6.6 GB download). Runs:
-  clone-neutral 20.8 s cold → 4.19 s @ −26.0 dBFS · emotion-happy 7.4 s → 4.64 s @ −16.1 dBFS
-  (the lever audibly hotter) · duration-3s 6.2 s → **3.00 s EXACT** @ −26.8 dBFS. Memory:
-  engine-charged 5.00 GB = declared; phys floor 4.76 GB, run peak 9.61 GB ⇒ transient
-  ≈4.85 GB (manifest declares 5.0 GB); post-evict phys 0.37 GB (clean reclaim).
-- **Remaining (needs authorization, out of Stage 2):** publish xocialize/mlx-indextts2-swift +
-  mlx-audio-dsp repos (then whisper-mlx-swift URL dep + tag), weight re-publish
-  (+ campplus/emo-matrices safetensors, fp16 w2v-BERT ≈ −1.1 GB), restore the app's remote
-  engine ref + package engine pin once ≥0.23.0 is tagged, E12 C5 promotion on 2nd adopter.
-
-## Dependencies by phase
-
-- P1: none (pure Swift). P2+: mlx-swift (+ mlx-swift-lm attention helpers).
-- P3: the `mlx-audio-dsp` shared leaf — **BUILT 2026-07-08** (`mlxengine-audio/PROD/mlx-audio-dsp`,
-  PROD-promoted 2026-07-09; consumed via remote tag v0.1.0,
-  module `MLXAudioDSP`): hann (periodic/symmetric) + povey windows, reflect-pad, strided framing
-  (center-STFT + kaldi snip-edges), DC-offset removal, per-frame pre-emphasis (kaldi x[−1]≡x[0]),
-  power/magnitude spectra (with kaldi pad-to-512), mel-filterbank apply. Filterbank GENERATION is
-  deliberately out (bake-fixed-transforms rule — heads ship baked filters dumped from the oracle).
-  whisper-mlx-swift REFACTORED onto the leaf, **bit-identical** (legacy-inline vs refactored
-  max_abs = 0; leaf hann vs baked window ≤1e-6). Whisper consumes it via local path — publish
-  `mlx-audio-dsp` + restore a URL dep before tagging whisper-mlx-swift.
-  Remaining P3 front-end work: the per-model heads (w2v-BERT Seamless-style normalized 80-mel with
-  `wav2vec2bert_stats` mean/std; CampPlus kaldi 80-fbank) + baked-filter dumps + HF-golden gates.
-- Stage 2: MLXToolKit (contract), NonCommercial weight gate (C7), Apache code (C8).
+- **The oracle's GPT prefix has one masked left-pad row** (official `prepare_gpt_inputs` pads to
+  `cond + len(text incl. stop) + 2` while the canonical text is `len + 2 − 1`). A fully masked key
+  contributes exactly 0 after softmax in fp32, so the Swift prefix omits it; `gpt input_emb` is
+  compared on the unpadded tail and the greedy rollout is token-exact.
+- **tiktoken's vocabulary has an empty-bytes token** (`= 48474`): Python's `b64decode("=")`
+  returns `b""`, Foundation's returns nil. Accept it explicitly; it can never match a piece.
+- **MeCab at g2p_ratio 0 still changes the text** — it re-joins morphemes with spaces
+  (punctuation included) — so "no G2P" is NOT "no-op". Apple's NaturalLanguage word tokenizer
+  reproduces the fixture boundaries; keep a ja fixture in the corpus so drift is visible.
+- **WeTextProcessing is LIVE in the 2.5 oracle env** (the 2.0 oracle install had it as a no-op),
+  so digit-bearing zh/en fixtures now differ (`2024 → twenty twenty four`, and it even expands
+  digits INSIDE pronunciation markup: `AH0 → AH ZERO`). Documented gap; the test asserts the
+  gap set is non-empty and digit-only so a future port has something to flip.
+- The codec's conv weights arrive in MLX layout `(out, k, in)` from the donor converter — no
+  transposes; the FVQ 1×1 out-projection `(1024, 1, 8)` squeezes to a Linear.
+- The 2.5 `s2mel.safetensors` still ships `gpt_layer.*` (the checkpoint is `DiT_gptlatent_10000`);
+  upstream constructs `MyModel` without `use_gpt_latent`, so the layer is dead weight. Kept in
+  the Swift module so the 0-unused contract holds; never called.
+- **The 2.5 donor's CFM solver returns x AFTER the final prompt-region re-zero** (solar2ain's
+  original — and this port — return the last Euler state before it). The prompt frames are
+  trimmed before BigVGAN either way, so the `s2mel` gate judges the generated region (BITWISE);
+  a whole-tensor compare reads cos 0.99988 / max_abs 0.36 purely from those discarded frames.
+- **Concurrent `swift build` / `swift test` corrupt `.build`** — every build in this port was
+  serialized behind the gate run it fed.

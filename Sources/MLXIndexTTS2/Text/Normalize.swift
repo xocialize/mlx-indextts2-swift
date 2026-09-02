@@ -227,6 +227,12 @@ public final class IndexTTSTextNormalizer: @unchecked Sendable {
         return out
     }
 
+    /// The 2.5 frontend's unconditional first step (`clean_pattern.sub` over CHAR_REP_MAP,
+    /// applied before the language-specific normalizer, for every language).
+    public func applyBaseCharRepMap(_ text: String) -> String {
+        applyCharRepMap(text, Self.charRepMap)
+    }
+
     // MARK: normalize
 
     public func normalize(_ input: String) -> String {

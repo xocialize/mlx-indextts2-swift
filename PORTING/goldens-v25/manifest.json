@@ -1,0 +1,20 @@
+{
+ "model_dir": "/Volumes/Satechi/Development/mlxengine-audio/WIP/indextts25/weights/mlx-indextts2-2.5-fp16",
+ "ref_wav": "/Volumes/Satechi/Development/mlxengine-audio/Archive/MLXEngineAudio/MLXEngineAudio/TTSValidation/indextts2-ref.wav",
+ "source_revision": "d0aa86e75bb6f3437f3831e95056fa72842d89ef",
+ "text": "The quick brown fox jumps over the lazy dog, and the afternoon light settles quietly on the river.",
+ "language": "en",
+ "language_id": 0,
+ "codes": 137,
+ "codes_compressed": 137,
+ "target_len": 471,
+ "ref_mel_len": 431,
+ "spk_cond_len": 250,
+ "wav_samples": 120576,
+ "wav_rms": 0.045715320855379105,
+ "wav_dbfs": -26.798764555335403,
+ "seed": 42,
+ "dtype": "fp32",
+ "device": "cpu",
+ "captured": "2026-09-02 07:05"
+}

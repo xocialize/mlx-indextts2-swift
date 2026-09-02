@@ -1,5 +1,5 @@
 // ManifestTests.swift — offline conformance checks on the Stage-2 contract surface:
-// two-layer license gate behavior (C7/C8), requirements shape (C10), specialty declaration
+// two-layer license declaration (C7/C8: 2.5 weights allowlisted), requirements shape (C10), specialty declaration
 // (C6), surface/capability derivation (C1/C2), and the E12 metaData emotion parser.
 
 import Foundation
@@ -12,15 +12,12 @@ final class ManifestTests: XCTestCase {
     let manifest = IndexTTS2Package.manifest
 
     func testLicenseGateTwoLayer() {
-        // C7: NonCommercial weights REJECTED by the default product policy…
-        XCTAssertFalse(LicensePolicy.permissiveOnly.evaluate(manifest.license).isAdmitted)
-        if case .rejectedWeight(let license) = LicensePolicy.permissiveOnly.evaluate(manifest.license) {
-            XCTAssertEqual(license, .indexTTS2Model)
-        } else {
-            XCTFail("expected the WEIGHT layer to be named (C8 legibility)")
-        }
-        // …and admitted only under the acknowledged eval policy.
-        XCTAssertTrue(LicensePolicy.permissiveOrAcknowledged.evaluate(manifest.license).isAdmitted)
+        // C7: the IndexTTS-2.5 weights (bilibili Model Use License Agreement) are on the
+        // engine's permissive allowlist — admitted under the DEFAULT product policy, no
+        // acknowledgement flow (the 2.0 non-commercial tier is gone).
+        XCTAssertEqual(manifest.license.weightLicense, .bilibiliModelUse)
+        XCTAssertTrue(LicensePolicy.permissiveOnly.evaluate(manifest.license).isAdmitted)
+        XCTAssertTrue(manifest.license.weightLicense.isPermissive)
         // C8: the port code itself is permissive.
         XCTAssertTrue(manifest.license.portCodeLicense.isPermissive)
     }

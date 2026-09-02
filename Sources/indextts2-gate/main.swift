@@ -1,38 +1,45 @@
-// indextts2-gate — CLI parity-gate lane for the IndexTTS2 Swift port.
+// indextts2-gate — the IndexTTS-2.5 parity-gate CLI lane (`swift run indextts2-gate <mode>`).
 //
-// Gates run here (plain `swift run`), not XCTest, per the mlx-swift-integration doctrine
-// (the SPM test product's metallib is unreliable for kernel work). fp32 gates pin the CPU
-// stream; quant gates (P7, later) must run the forward on GPU.
+// Every mode replays one stage of the port against the goldens captured from the donor
+// Python-MLX oracle (vanch007/mlx-indextts2 `v25`, fp32 CPU; PORTING/goldens-v25, captured by
+// WIP/indextts25/tools/capture_v25_goldens.py) and fails loudly outside the stated tolerance.
+// CPU lanes upcast the fp16 checkpoint to fp32 (the oracle's dtype) and pin the CPU device;
+// the GPU lanes (`e2e`, `quant`, `footprint`) run the production dtype on Metal.
 //
-// Usage:
-//   swift run indextts2-gate p2 [--weights <dir>] [--goldens <dir>]
-//
-// p2: teacher-forced UnifiedVoiceV2.forwardLatent vs the Stage-0 `gpt_latent` golden,
-//     with the captured `conditioning` golden injected. Gate: cosine ≥ 0.999 (fp32, CPU).
+// Modes: tok | ref | gpt | codec | s2mel | e2e | quant | footprint | all
+//   --weights <dir>   the converted 2.5 checkpoint (default: WIP/indextts25/weights/mlx-indextts2-2.5-fp16)
+//   --w2v <dir>       facebook/w2v-bert-2.0 model.safetensors directory (default: the 2.0 store copy)
+//   --goldens <dir>   golden directory (default: PORTING/goldens-v25 under the cwd)
 
 import Foundation
 import MLX
-import MLXAudioDSP
 import MLXNN
+import MLXRandom
 import MLXIndexTTS2
 
-// MARK: - Helpers
+// MARK: - Plumbing
 
 func fail(_ message: String) -> Never {
-    FileHandle.standardError.write(("FAIL: " + message + "\n").data(using: .utf8)!)
+    FileHandle.standardError.write(("✗ " + message + "\n").data(using: .utf8)!)
     exit(1)
 }
 
 func cosine(_ a: MLXArray, _ b: MLXArray) -> Float {
     let x = a.asType(.float32).reshaped(-1)
     let y = b.asType(.float32).reshaped(-1)
-    let num = sum(x * y)
-    let den = sqrt(sum(x * x)) * sqrt(sum(y * y))
-    return (num / den).item(Float.self)
+    let dot = sum(x * y).item(Float.self)
+    let nx = sqrt(sum(x * x)).item(Float.self)
+    let ny = sqrt(sum(y * y)).item(Float.self)
+    return dot / max(nx * ny, 1e-12)
 }
 
 func maxAbsDiff(_ a: MLXArray, _ b: MLXArray) -> Float {
     MLX.abs(a.asType(.float32) - b.asType(.float32)).max().item(Float.self)
+}
+
+func dbfs(_ samples: [Float]) -> Float {
+    let rms = sqrt(samples.reduce(0) { $0 + $1 * $1 } / Float(max(samples.count, 1)))
+    return 20 * log10(max(rms, 1e-9))
 }
 
 func argValue(_ name: String) -> String? {
@@ -41,1522 +48,335 @@ func argValue(_ name: String) -> String? {
     return args[idx + 1]
 }
 
-let home = FileManager.default.homeDirectoryForCurrentUser
-let defaultWeights = home.appending(
-    path: ".cache/huggingface/hub/models--vanch007--mlx-indextts2-standard-fp16/snapshots/31118db400202a438e4d42bbce8e426298072d50")
-let defaultGoldens = home.appending(path: "Development/_indextts2-oracle/goldens")
+let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+let weightsDir = argValue("--weights").map { URL(fileURLWithPath: $0) }
+    ?? URL(fileURLWithPath: "/Volumes/Satechi/Development/mlxengine-audio/WIP/indextts25/weights/mlx-indextts2-2.5-fp16")
+let w2vDir = argValue("--w2v").map { URL(fileURLWithPath: $0) }
+    ?? URL(fileURLWithPath: NSString(string: "~/.cache/huggingface/hub/models--facebook--w2v-bert-2.0/snapshots/da985ba0987f70aaeb84a80f2851cfac8c697a7b").expandingTildeInPath)
+let goldensDir = argValue("--goldens").map { URL(fileURLWithPath: $0) } ?? cwd.appending(path: "PORTING/goldens-v25")
 
-let weightsDir = argValue("--weights").map { URL(fileURLWithPath: $0) } ?? defaultWeights
-let goldensDir = argValue("--goldens").map { URL(fileURLWithPath: $0) } ?? defaultGoldens
-
-/// Shared UnifiedVoiceV2 loader: full-model key contract (0-missing/0-unused after
-/// sanitize), fp32 upcast materialized before any forward (watchdog corollary).
-func loadUnifiedVoiceV2() throws -> UnifiedVoiceV2 {
-    let model = UnifiedVoiceV2()
-    let declared = Set(model.parameters().flattened().map(\.0))
-
-    let raw = try loadArrays(url: weightsDir.appending(path: "gpt.safetensors"))
-    let sanitized = UnifiedVoiceV2.sanitize(raw)
-
-    let missing = declared.subtracting(sanitized.keys)
-    let unused = Set(sanitized.keys).subtracting(declared)
-    guard missing.isEmpty else { fail("missing keys: \(missing.sorted().prefix(8)) …") }
-    guard unused.isEmpty else { fail("unused keys: \(unused.sorted().prefix(8)) …") }
-    print("  keys: \(sanitized.count) (declared \(declared.count)); contract 0-missing/0-unused OK")
-
-    let fp32 = sanitized.mapValues { $0.asType(.float32) }
-    try model.update(parameters: ModuleParameters.unflattened(fp32), verify: .all)
-    eval(model)
-    return model
+func golden(_ name: String) throws -> MLXArray {
+    try NPY.load(goldensDir.appending(path: "\(name).npy")).asType(.float32)
 }
 
-// MARK: - P2 gate
+func goldenInts(_ name: String) throws -> [Int] {
+    try NPY.load(goldensDir.appending(path: "\(name).npy")).asType(.int32).asArray(Int32.self).map(Int.init)
+}
 
-func gateP2() throws {
-    // fp32 parity on the CPU stream (weight loads must be CPU-stream anyway).
-    Device.setDefault(device: Device(.cpu))
-
-    print("→ loading goldens from \(goldensDir.path)")
-    let conditioning = try NPY.load(goldensDir.appending(path: "core_gpt_conditioning.npy")).asType(.float32)
-    let textTokens = try NPY.load(goldensDir.appending(path: "core_gpt_latent__in0.npy"))
-    let melCodes = try NPY.load(goldensDir.appending(path: "core_gpt_latent__in1.npy"))
-    let goldenLatent = try NPY.load(goldensDir.appending(path: "core_gpt_latent.npy")).asType(.float32)
-    print("  conditioning \(conditioning.shape)  text \(textTokens.shape)  mel \(melCodes.shape)  golden \(goldenLatent.shape)")
-
-    print("→ building UnifiedVoiceV2 + loading gpt.safetensors")
-    let model = try loadUnifiedVoiceV2()
-
-    print("→ teacher-forced forwardLatent")
-    let start = Date()
-    let latent = model.forwardLatent(
-        conditioning: conditioning, textTokens: textTokens, melCodes: melCodes)
-    eval(latent)
-    let elapsed = Date().timeIntervalSince(start)
-
-    guard latent.shape == goldenLatent.shape else {
-        fail("shape mismatch: \(latent.shape) vs golden \(goldenLatent.shape)")
-    }
-    let cos = cosine(latent, goldenLatent)
-    let mad = maxAbsDiff(latent, goldenLatent)
-    print(String(format: "  cos=%.7f  max_abs=%.5f  (%.2fs)", cos, mad, elapsed))
-
-    if cos >= 0.999 {
-        print("P2 GATE PASSED (cos ≥ 0.999)")
-    } else {
-        fail(String(format: "P2 gate cos %.7f < 0.999", cos))
+func check(_ name: String, _ ours: MLXArray, _ gold: MLXArray, cosMin: Float, madMax: Float) {
+    guard ours.shape == gold.shape else { fail("\(name): shape \(ours.shape) vs golden \(gold.shape)") }
+    let cos = cosine(ours, gold)
+    let mad = maxAbsDiff(ours, gold)
+    print(String(format: "  %@  cos=%.7f  max_abs=%.3e", name.padding(toLength: 26, withPad: " ", startingAt: 0), cos, mad))
+    if cos < cosMin || mad > madMax {
+        fail(String(format: "%@ gate failed (cos %.7f < %.5f or max_abs %.3e > %.3e)", name, cos, cosMin, mad, madMax))
     }
 }
 
-// MARK: - P3 front-end gate (fbank heads vs HF/torchaudio goldens)
+struct GoldenText: Codable { let text: String; let language: String; let language_id: Int; let token_ids: [Int] }
 
-func gateP3Frontend() throws {
-    Device.setDefault(device: Device(.cpu))
-    let fe = goldensDir.appending(path: "frontend")
-
-    func check(_ name: String, _ ours: MLXArray, _ goldenFile: String,
-               cosMin: Float, madMax: Float) throws {
-        let golden = try NPY.load(fe.appending(path: goldenFile)).asType(.float32)
-        let mine = ours.asType(.float32)
-        guard mine.shape == golden.shape else {
-            fail("\(name): shape \(mine.shape) vs golden \(golden.shape)")
-        }
-        let cos = cosine(mine, golden)
-        let mad = maxAbsDiff(mine, golden)
-        print(String(format: "  %@  cos=%.7f  max_abs=%.6f", name, cos, mad))
-        if cos < cosMin || mad > madMax {
-            fail(String(format: "%@ gate failed (cos %.7f < %.4f or max_abs %.6f > %.4f)",
-                        name, cos, cosMin, mad, madMax))
-        }
-    }
-
-    for (tag, audioFile) in [("ref", "audio_16k.npy"), ("synth", "synth_16k.npy")] {
-        var wav = try NPY.load(fe.appending(path: audioFile)).asType(.float32)
-        if wav.ndim == 2 { wav = wav[0] }  // (1, T) → (T,)
-        print("→ \(tag): \(wav.dim(0)) samples")
-
-        guard let sFbank = SeamlessFeatureExtractor.fbank(wav),
-              let (features, mask) = SeamlessFeatureExtractor.callAsFeatures(wav),
-              let cFbank = CampPlusFbank.fbankCMN(wav)
-        else { fail("\(tag): audio shorter than one frame") }
-        eval(sFbank, features, mask, cFbank)
-
-        let suffix = tag == "ref" ? "" : "_synth"
-        if tag == "ref" {
-            try check("seamless fbank raw", sFbank, "seamless_fbank_raw.npy",
-                      cosMin: 0.99999, madMax: 5e-3)
-            let goldenMask = try NPY.load(fe.appending(path: "seamless_attention_mask.npy"))
-            let maskSum = mask.asType(.int32).sum().item(Int32.self)
-            let goldenSum = goldenMask.asType(.int32).sum().item(Int32.self)
-            guard maskSum == goldenSum else { fail("mask sum \(maskSum) vs golden \(goldenSum)") }
-            print("  attention mask sum \(maskSum) ✓")
-        }
-        try check("seamless input_features\(suffix)", features,
-                  "seamless_input_features\(suffix).npy", cosMin: 0.9999, madMax: 2e-2)
-        try check("campplus fbank cmn\(suffix)", cFbank,
-                  "campplus_fbank_cmn\(suffix).npy", cosMin: 0.99999, madMax: 5e-3)
-    }
-    print("P3-FRONTEND GATE PASSED")
+func loadGenerator(fp32: Bool, quantBits: Int? = nil) throws -> IndexTTS2Generator {
+    let t0 = Date()
+    let g = try IndexTTS2Generator.load(modelDirectory: weightsDir, w2vBertDirectory: w2vDir, quantBits: quantBits)
+    if fp32 { g.upcast(to: .float32) }
+    print(String(format: "→ generator loaded%@ in %.1fs", fp32 ? " (fp32 upcast)" : "", Date().timeIntervalSince(t0)))
+    return g
 }
 
-// MARK: - P3b w2v-BERT Conformer gate
-
-func gateP3W2VBert() throws {
-    Device.setDefault(device: Device(.cpu))
-    let ladder = goldensDir.appending(path: "w2vbert")
-
-    let defaultW2V = home.appending(
-        path: ".cache/huggingface/hub/models--facebook--w2v-bert-2.0/snapshots/da985ba0987f70aaeb84a80f2851cfac8c697a7b")
-    let w2vDir = argValue("--w2v-weights").map { URL(fileURLWithPath: $0) } ?? defaultW2V
-
-    print("→ building Wav2Vec2BertModel + loading model.safetensors")
-    let model = Wav2Vec2BertModel()
-    let declared = Set(model.parameters().flattened().map(\.0))
-
-    let raw = try loadArrays(url: w2vDir.appending(path: "model.safetensors"))
-    let sanitized = Wav2Vec2BertModel.sanitize(raw).mapValues { $0.asType(.float32) }
-
-    let onDisk = Set(sanitized.keys)
-    let missing = declared.subtracting(onDisk)
-    let unused = onDisk.subtracting(declared)
-    guard missing.isEmpty else { fail("missing keys: \(missing.sorted().prefix(8)) …") }
-    guard unused.isEmpty else { fail("unused keys: \(unused.sorted().prefix(8)) …") }
-    print("  keys: \(sanitized.count) (declared \(declared.count)); contract 0-missing/0-unused OK")
-
-    try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: .all)
-    eval(model)
-
-    let mean = try NPY.load(ladder.appending(path: "semantic_mean.npy")).asType(.float32)
-    let std = try NPY.load(ladder.appending(path: "semantic_std.npy")).asType(.float32)
-    let golden = try NPY.load(goldensDir.appending(path: "frontend_ref__spk_cond_emb.npy")).asType(.float32)
-
-    // --- Ladder A: injected golden input_features (isolates the Conformer port) ---
-    print("→ ladder A: injected golden input_features")
-    let inputFeatures = try NPY.load(ladder.appending(path: "input_features.npy")).asType(.float32)
-    let attentionMask = try NPY.load(ladder.appending(path: "attention_mask.npy")).asType(.int32)
-    print("  input \(inputFeatures.shape)  mask sum \(attentionMask.sum().item(Int32.self))")
-
-    let start = Date()
-    let (_, hs) = model(inputFeatures: inputFeatures, attentionMask: attentionMask)
-    eval(hs)
-    print(String(format: "  forward %.2fs (%d hidden states)", Date().timeIntervalSince(start), hs.count))
-
-    var worst: (Float, Int) = (0, -1)
-    for i in 0 ..< hs.count {
-        let g = try NPY.load(ladder.appending(path: String(format: "hidden_states_%02d.npy", i)))
-        let mad = maxAbsDiff(hs[i], g)
-        if mad > worst.0 { worst = (mad, i) }
-        if mad > 1e-3 { fail(String(format: "hidden_states[%d] max_abs %.6f > 1e-3", i, mad)) }
-    }
-    print(String(format: "  25 hidden states ≤ 1e-3 ✓ (worst %.2e at hs[%d])", worst.0, worst.1))
-
-    let tapA = Wav2Vec2BertModel.semanticTap(hs, mean: mean, std: std)
-    let madA = maxAbsDiff(tapA, golden)
-    let cosA = cosine(tapA, golden)
-    print(String(format: "  normalized hs[17] vs spk_cond_emb golden: cos=%.7f max_abs=%.2e", cosA, madA))
-    guard madA < 1e-3 else { fail(String(format: "ladder-A tap max_abs %.6f > 1e-3", madA)) }
-
-    // --- Chain B: full Swift front-end (audio → SeamlessFeatureExtractor → Conformer) ---
-    print("→ chain B: full Swift chain from audio_16k")
-    var wav = try NPY.load(goldensDir.appending(path: "frontend/audio_16k.npy")).asType(.float32)
-    if wav.ndim == 2 { wav = wav[0] }
-    guard let (features, mask) = SeamlessFeatureExtractor.callAsFeatures(wav) else {
-        fail("feature extraction failed")
-    }
-    let (_, hsB) = model(inputFeatures: features, attentionMask: mask)
-    let tapB = Wav2Vec2BertModel.semanticTap(hsB, mean: mean, std: std)
-    eval(tapB)
-    guard tapB.shape == golden.shape else {
-        fail("chain-B shape \(tapB.shape) vs golden \(golden.shape)")
-    }
-    let cosB = cosine(tapB, golden)
-    let madB = maxAbsDiff(tapB, golden)
-    print(String(format: "  spk_cond_emb: cos=%.7f max_abs=%.5f", cosB, madB))
-    guard cosB >= 0.999 else { fail(String(format: "chain-B cos %.7f < 0.999", cosB)) }
-
-    print("P3B-W2VBERT GATE PASSED")
-}
-
-// MARK: - P3b MaskGCT RepCodec gate
-
-func gateP3MaskGCT() throws {
-    Device.setDefault(device: Device(.cpu))
-    let ladder = goldensDir.appending(path: "maskgct")
-
-    let defaultMGC = home.appending(
-        path: ".cache/huggingface/hub/models--amphion--MaskGCT/snapshots/265c6cef07625665d0c28d2faafb1415562379dc/semantic_codec")
-    let mgcDir = argValue("--maskgct-weights").map { URL(fileURLWithPath: $0) } ?? defaultMGC
-
-    print("→ building RepCodec + loading semantic_codec/model.safetensors")
-    let model = RepCodec()
-    let declared = Set(model.parameters().flattened().map(\.0))
-
-    let raw = try loadArrays(url: mgcDir.appending(path: "model.safetensors"))
-    let sanitized = RepCodec.sanitize(raw).mapValues { $0.asType(.float32) }
-
-    let missing = declared.subtracting(sanitized.keys)
-    let unused = Set(sanitized.keys).subtracting(declared)
-    guard missing.isEmpty else { fail("missing keys: \(missing.sorted().prefix(8)) …") }
-    guard unused.isEmpty else { fail("unused keys: \(unused.sorted().prefix(8)) …") }
-    print("  keys: \(sanitized.count) (declared \(declared.count)); contract 0-missing/0-unused OK")
-
-    try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: .all)
-    eval(model)
-
-    let x = try NPY.load(goldensDir.appending(path: "frontend_ref__spk_cond_emb.npy")).asType(.float32)
-    let sRefGolden = try NPY.load(goldensDir.appending(path: "frontend_ref__S_ref.npy")).asType(.float32)
-
-    // Some ladder goldens were captured channels-first (B,C,T); transpose to our (B,T,C).
-    func check(_ name: String, _ ours: MLXArray, _ file: String, thr: Float = 1e-3) throws {
-        var g = try NPY.load(ladder.appending(path: file)).asType(.float32)
-        if ours.shape != g.shape && g.ndim == 3 && ours.ndim == 3
-            && g.shape == [ours.dim(0), ours.dim(2), ours.dim(1)] {
-            g = g.transposed(0, 2, 1)
-        }
-        guard ours.shape == g.shape else { fail("\(name): shape \(ours.shape) vs golden \(g.shape)") }
-        let mad = maxAbsDiff(ours, g)
-        print(String(format: "  %@ max_abs = %.3e", name.padding(toLength: 20, withPad: " ", startingAt: 0), mad))
-        if mad >= thr { fail(String(format: "%@ max_abs %.3e ≥ %.0e", name, mad, thr)) }
-    }
-
-    print("→ encoder ladder")
-    let vb = model.encoderBackboneModule
-    let ex = vb.embedLayer(x)
-    try check("enc_vb_embed", ex, "enc_vb_embed.npy")
-    var cx = vb.normLayer(ex)
-    try check("enc_vb_norm", cx, "enc_vb_norm.npy")
-    for (i, block) in vb.convnextBlocks.enumerated() {
-        cx = block(cx)
-        if [0, 5, 11].contains(i) {
-            try check("enc_vb_convnext_\(i)", cx, "enc_vb_convnext_\(i).npy")
-        }
-    }
-    let fx = vb.finalLayerNormLayer(cx)
-    try check("enc_vb_final", fx, "enc_vb_final.npy")
-    let z = model.encoderProjLayer(fx)
-    try check("enc_out_z", z, "enc_out_z.npy")
-
-    print("→ quantizer ladder")
-    let fvq = model.quantizerModule.firstQuantizer
-    let zE = fvq.inProject(z)
-    try check("fvq_z_e", zE, "fvq_z_e.npy")
-    let (zQ, indices) = fvq.decodeLatents(zE)
-    try check("fvq_zq_prelatent", zQ, "fvq_zq_prelatent.npy")
-    let ladIdx = try NPY.load(ladder.appending(path: "fvq_indices.npy"))
-        .asType(.int32).reshaped(indices.shape)
-    let idxMatches = (indices.asType(.int32) .== ladIdx).sum().item(Int32.self)
-    let idxTotal = Int32(indices.size)
-    print("  fvq_indices \(idxMatches)/\(idxTotal) exact")
-    guard idxMatches == idxTotal else { fail("fvq_indices only \(idxMatches)/\(idxTotal) match") }
-    try check("fvq_zq_out", fvq.outProject(zQ), "fvq_zq_out.npy")
-
-    print("→ final gate: quantize() vs pipeline golden")
-    let (codes, sRef) = model.quantize(x)
-    eval(codes, sRef)
-    let goldCodes = try NPY.load(ladder.appending(path: "codes.npy"))
-        .asType(.int32).reshaped(codes.shape)
-    let codeMatches = (codes.asType(.int32) .== goldCodes).sum().item(Int32.self)
-    let codeTotal = Int32(codes.size)
-    let lo = codes.min().item(Int32.self), hi = codes.max().item(Int32.self)
-    print("  codes \(codeMatches)/\(codeTotal) exact (range \(lo)..\(hi))")
-    guard codeMatches == codeTotal else { fail("codes only \(codeMatches)/\(codeTotal) match") }
-
-    let madFinal = maxAbsDiff(sRef, sRefGolden)
-    let cosFinal = cosine(sRef, sRefGolden)
-    print(String(format: "  S_ref vs golden: cos=%.7f max_abs=%.3e", cosFinal, madFinal))
-    guard madFinal < 1e-3 else { fail(String(format: "S_ref max_abs %.3e ≥ 1e-3", madFinal)) }
-
-    print("P3B-MASKGCT GATE PASSED")
-}
-
-// MARK: - P3b CampPlus gate
-
-func gateP3CampPlus() throws {
-    Device.setDefault(device: Device(.cpu))
-    let ladder = goldensDir.appending(path: "campplus")
-
-    let defaultCPP = home.appending(path: "Development/_indextts2-oracle/campplus_cn_common.safetensors")
-    let cppFile = argValue("--campplus-weights").map { URL(fileURLWithPath: $0) } ?? defaultCPP
-
-    print("→ building CAMPPlus(80, 192) + loading campplus_cn_common.safetensors")
-    let model = CAMPPlus()
-    model.train(false)  // BatchNorms must use running stats
-    let declared = Set(model.parameters().flattened().map(\.0))
-
-    let raw = try loadArrays(url: cppFile)
-    let sanitized = CAMPPlus.sanitize(raw).mapValues { $0.asType(.float32) }
-
-    let missing = declared.subtracting(sanitized.keys)
-    let unused = Set(sanitized.keys).subtracting(declared)
-    guard missing.isEmpty else { fail("missing keys: \(missing.sorted().prefix(8)) …") }
-    guard unused.isEmpty else { fail("unused keys: \(unused.sorted().prefix(8)) …") }
-    print("  keys: \(sanitized.count) (declared \(declared.count)); contract 0-missing/0-unused OK")
-
-    try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: .all)
-    eval(model)
-
-    func check(_ name: String, _ ours: MLXArray, thr: Float = 1e-3) throws {
-        var g = try NPY.load(ladder.appending(path: "\(name).npy")).asType(.float32)
-        if ours.shape != g.shape && g.ndim == 3 && ours.ndim == 3
-            && g.shape == [ours.dim(0), ours.dim(2), ours.dim(1)] {
-            g = g.transposed(0, 2, 1)
-        }
-        guard ours.shape == g.shape else { fail("\(name): shape \(ours.shape) vs golden \(g.shape)") }
-        let mad = maxAbsDiff(ours, g)
-        print(String(format: "  %@ max_abs = %.3e", name.padding(toLength: 20, withPad: " ", startingAt: 0), mad))
-        if mad >= thr { fail(String(format: "%@ max_abs %.3e ≥ %.0e", name, mad, thr)) }
-    }
-
-    print("→ ladder (input = campplus_fbank_cmn golden)")
-    let feat = try NPY.load(goldensDir.appending(path: "frontend/campplus_fbank_cmn.npy")).asType(.float32)
-    var h = feat[.newAxis, 0..., 0...]  // (1, T, 80)
-    h = model.headModule(h)
-    try check("head_out", h)
-    for (name, stage) in model.xvectorModule.stages {
-        h = stage(h)
-        try check(name, h)
-    }
-
-    print("→ final gate: style vs pipeline golden")
-    let golden = try NPY.load(goldensDir.appending(path: "frontend_ref__style.npy")).asType(.float32)
-    let style = model(feat[.newAxis, 0..., 0...])
-    eval(style)
-    guard style.shape == golden.shape else { fail("style shape \(style.shape) vs \(golden.shape)") }
-    let cos = cosine(style, golden)
-    let mad = maxAbsDiff(style, golden)
-    print(String(format: "  style: cos=%.7f max_abs=%.3e", cos, mad))
-    guard mad < 1e-3 else { fail(String(format: "style max_abs %.3e ≥ 1e-3", mad)) }
-
-    // Full Swift chain: audio → CampPlusFbank.fbankCMN → CAMPPlus.
-    print("→ chain: full Swift front-end from audio_16k")
-    var wav = try NPY.load(goldensDir.appending(path: "frontend/audio_16k.npy")).asType(.float32)
-    if wav.ndim == 2 { wav = wav[0] }
-    guard let cmn = CampPlusFbank.fbankCMN(wav) else { fail("fbank failed") }
-    let styleChain = model(cmn[.newAxis, 0..., 0...])
-    eval(styleChain)
-    let cosChain = cosine(styleChain, golden)
-    let madChain = maxAbsDiff(styleChain, golden)
-    print(String(format: "  style (chain): cos=%.7f max_abs=%.5f", cosChain, madChain))
-    guard cosChain >= 0.999 else { fail(String(format: "chain cos %.7f < 0.999", cosChain)) }
-
-    print("P3B-CAMPPLUS GATE PASSED")
-}
-
-// MARK: - P3b GPT conditioner gate (conformer + perceiver + emovec + full conditioning)
-
-func gateP3Conditioners() throws {
-    Device.setDefault(device: Device(.cpu))
-
-    print("→ building UnifiedVoiceV2 + loading gpt.safetensors")
-    let model = try loadUnifiedVoiceV2()
-
-    // Oracle inputs/goldens (fp16-weight MLX-Metal capture → cos gates, like P2).
-    let spkCondEmb = try NPY.load(goldensDir.appending(path: "frontend_ref__spk_cond_emb.npy")).asType(.float32)
-    let spkNCL = spkCondEmb.transposed(0, 2, 1)  // (1, 1024, T) NCL, as generate_v2 feeds it
-
-    func gate(_ name: String, _ ours: MLXArray, _ goldenFile: String) throws {
-        let golden = try NPY.load(goldensDir.appending(path: goldenFile)).asType(.float32)
-        guard ours.shape == golden.shape else {
-            fail("\(name): shape \(ours.shape) vs golden \(golden.shape)")
-        }
-        let cos = cosine(ours, golden)
-        let mad = maxAbsDiff(ours, golden)
-        print(String(format: "  %@ cos=%.7f max_abs=%.5f",
-                     name.padding(toLength: 22, withPad: " ", startingAt: 0), cos, mad))
-        guard cos >= 0.999 else { fail(String(format: "%@ cos %.7f < 0.999", name, cos)) }
-    }
-
-    print("→ get_conditioning (speaker conformer + 32-latent perceiver)")
-    let speechCond = model.getConditioning(spkNCL)
-    eval(speechCond)
-    try gate("speech_cond", speechCond, "core_gpt_speech_cond.npy")
-
-    print("→ get_emovec (emotion conformer + 1-latent perceiver + emovec/emo layers)")
-    let baseEmovec = model.getEmovec(spkNCL)
-    eval(baseEmovec)
-    try gate("base_emovec", baseEmovec, "core_gpt_base_emovec.npy")
-
-    print("→ prepare_conditioning_latents (emotion 'happy' α=0.6 blend)")
-    // generate_v2: weights={happy: 1.0}·α → weight_sum=0.6 → emo_vec = mat + 0.4·base
-    let emovecMat = try NPY.load(goldensDir.appending(path: "frontend_emovec_mat.npy")).asType(.float32)
-    let emoVec = emovecMat + 0.4 * baseEmovec
-    let conditioning = model.prepareConditioningLatents(
-        speechConditioning: speechCond, emoVec: emoVec, batchSize: 1)
-    eval(conditioning)
-    try gate("conditioning", conditioning, "core_gpt_conditioning.npy")
-
-    print("P3B-CONDITIONERS GATE PASSED")
-}
-
-// MARK: - Shared S2Mel loader (P4/P6)
-
-func loadS2Mel() throws -> S2Mel {
-    let model = S2Mel()
-    let declared = Set(model.parameters().flattened().map(\.0))
-
-    let raw = try loadArrays(url: weightsDir.appending(path: "s2mel.safetensors"))
-    let sanitized = S2Mel.sanitize(raw)
-
-    let missing = declared.subtracting(sanitized.keys)
-    let unused = Set(sanitized.keys).subtracting(declared)
-    guard missing.isEmpty else { fail("missing keys: \(missing.sorted().prefix(8)) …") }
-    guard unused.isEmpty else { fail("unused keys: \(unused.sorted().prefix(8)) …") }
-    print("  keys: \(sanitized.count) (declared \(declared.count)); contract 0-missing/0-unused OK")
-
-    let fp32 = sanitized.mapValues { $0.asType(.float32) }
-    try model.update(parameters: ModuleParameters.unflattened(fp32), verify: .all)
-    eval(model)
-    return model
-}
-
-// MARK: - P4 gate: S2Mel (gpt_layer → length_regulator → CFM)
-
-// The original Stage-0 cfm_mel golden sits past the AR sampler's RNG consumption and is not
-// reproducible from seed(42) alone; P4 gates against the seed-42 REPLAY goldens
-// (tools/dump_s2mel_replay.py — deterministic stages verified bitwise vs the originals).
-func gateP4() throws {
-    Device.setDefault(device: Device(.cpu))
-
-    print("→ building S2Mel + loading s2mel.safetensors")
-    let model = try loadS2Mel()
-
-    func gate(_ name: String, _ ours: MLXArray, _ goldenFile: String, cosMin: Float = 0.999) throws {
-        let golden = try NPY.load(goldensDir.appending(path: goldenFile)).asType(.float32)
-        guard ours.shape == golden.shape else {
-            fail("\(name): shape \(ours.shape) vs golden \(golden.shape)")
-        }
-        let cos = cosine(ours, golden)
-        let mad = maxAbsDiff(ours, golden)
-        print(String(format: "  %@ cos=%.7f max_abs=%.5f",
-                     name.padding(toLength: 22, withPad: " ", startingAt: 0), cos, mad))
-        guard cos >= cosMin else { fail(String(format: "%@ cos %.7f < %.4f", name, cos, cosMin)) }
-    }
-
-    // --- gpt_layer ---
-    print("→ gpt_layer (1280→256→128→1024)")
-    let latent = try NPY.load(goldensDir.appending(path: "core_gpt_latent.npy")).asType(.float32)
-    let gptOut = model.gptLayerModule(latent)
-    eval(gptOut)
-    try gate("gptlayer", gptOut, "core_s2mel_gptlayer.npy")
-
-    // --- length_regulator (golden-injected input for stage isolation) ---
-    print("→ length_regulator (nearest ×1.72 + conv-norm-mish ×4)")
-    let gptGolden = try NPY.load(goldensDir.appending(path: "core_s2mel_gptlayer.npy")).asType(.float32)
-    let vq2emb = try NPY.load(goldensDir.appending(path: "core_vq2emb.npy")).asType(.float32)
-    let sInfer = vq2emb.transposed(0, 2, 1) + gptGolden
-    let codeLen = latent.dim(1)
-    let targetLengths = MLXArray([Int32(Float(codeLen) * 1.72)])
-    let lenregOut = model.lengthRegulatorModule(sInfer, ylens: targetLengths)
-    eval(lenregOut)
-    try gate("lenreg", lenregOut, "core_s2mel_lenreg__0.npy")
-
-    // --- CFM inputs (golden-injected) ---
-    let lenregGolden = try NPY.load(goldensDir.appending(path: "core_s2mel_lenreg__0.npy")).asType(.float32)
-    let promptCondition = try NPY.load(goldensDir.appending(path: "frontend_ref__prompt_condition.npy")).asType(.float32)
-    let refMel = try NPY.load(goldensDir.appending(path: "frontend_ref__ref_mel.npy")).asType(.float32)
-    let style = try NPY.load(goldensDir.appending(path: "frontend_ref__style.npy")).asType(.float32)
-    let catCondition = concatenated([promptCondition, lenregGolden], axis: 1)
-    let xLens = MLXArray([Int32(catCondition.dim(1))])
-
-    // --- RNG cross-binding check: seed(42) → first normal draw must equal the replay z ---
-    print("→ RNG stream check (seed 42 → normal(1,80,\(catCondition.dim(1))))")
-    let zGolden = try NPY.load(goldensDir.appending(path: "core_s2mel_cfm_z_seed42.npy")).asType(.float32)
-    MLXRandom.seed(42)
-    let zSwift = MLXRandom.normal([1, 80, catCondition.dim(1)])
-    eval(zSwift)
-    let zMad = maxAbsDiff(zSwift, zGolden)
-    print(String(format: "  z draw max_abs=%.2e %@", zMad,
-                 zMad == 0 ? "(bit-identical)" : "(NOT bit-identical — CFM gate uses injected z)"))
-
-    // --- single DiT forward (step-1 ladder; isolates the estimator from the ODE loop) ---
-    print("→ DiT single forward (step 1, stacked CFG batch)")
-    let promptLen = refMel.dim(2)
-    let T = catCondition.dim(1)
-    let promptX = concatenated([refMel, MLXArray.zeros([1, 80, T - promptLen])], axis: 2)
-    let x0 = concatenated(
-        [MLXArray.zeros([1, 80, promptLen]), zGolden[0..., 0..., promptLen...]], axis: 2)
-    let stackedDphi = model.cfmModule.estimatorModule(
-        concatenated([x0, x0], axis: 0),
-        promptX: concatenated([promptX, MLXArray.zeros(like: promptX)], axis: 0),
-        xLens: xLens,
-        t: MLXArray([Float(0), Float(0)]),
-        style: concatenated([style, MLXArray.zeros(like: style)], axis: 0),
-        cond: concatenated([catCondition, MLXArray.zeros(like: catCondition)], axis: 0))
-    eval(stackedDphi)
-    try gate("dit_step1", stackedDphi, "core_s2mel_dit_step1_seed42.npy")
-
-    // --- full 25-step CFM (injected z isolates the loop from RNG) ---
-    print("→ CFM inference (25 steps, cfg_rate 0.7, injected z)")
-    let start = Date()
-    let mel = model.cfmModule.inference(
-        mu: catCondition, xLens: xLens, prompt: refMel, style: style,
-        nTimesteps: 25, temperature: 1.0, inferenceCfgRate: 0.7, injectedZ: zGolden)
-    eval(mel)
-    print(String(format: "  (%.2fs)", Date().timeIntervalSince(start)))
-    try gate("cfm_mel", mel, "core_s2mel_cfm_mel_seed42.npy")
-
-    print("P4 GATE PASSED")
-}
-
-// MARK: - Shared BigVGAN loader (P5/P6)
-
-func loadBigVGAN() throws -> BigVGANV2 {
-    let model = BigVGANV2()
-    let declared = Set(model.parameters().flattened().map(\.0))
-
-    let raw = try loadArrays(url: weightsDir.appending(path: "bigvgan.safetensors"))
-
-    let missing = declared.subtracting(raw.keys)
-    let unused = Set(raw.keys).subtracting(declared)
-    guard missing.isEmpty else { fail("missing keys: \(missing.sorted().prefix(8)) …") }
-    guard unused.isEmpty else { fail("unused keys: \(unused.sorted().prefix(8)) …") }
-    print("  keys: \(raw.count) (declared \(declared.count)); contract 0-missing/0-unused OK")
-
-    let fp32 = raw.mapValues { $0.asType(.float32) }
-    try model.update(parameters: ModuleParameters.unflattened(fp32), verify: .all)
-    eval(model)
-    return model
-}
-
-// MARK: - P5 gate: BigVGAN v2 vocoder
-
-func gateP5() throws {
-    Device.setDefault(device: Device(.cpu))
-
-    print("→ building BigVGANV2 + loading bigvgan.safetensors")
-    let model = try loadBigVGAN()
-
-    func gate(_ name: String, mel: MLXArray, goldenFile: String) throws {
-        let promptLen = 431
-        let wav = model(mel[0..., 0..., promptLen...])
-        eval(wav)
-        let golden = try NPY.load(goldensDir.appending(path: goldenFile)).asType(.float32)
-        guard wav.shape == golden.shape else {
-            fail("\(name): shape \(wav.shape) vs golden \(golden.shape)")
-        }
-        let cos = cosine(wav, golden)
-        let mad = maxAbsDiff(wav, golden)
-        print(String(format: "  %@ cos=%.7f max_abs=%.5f",
-                     name.padding(toLength: 22, withPad: " ", startingAt: 0), cos, mad))
-        guard cos >= 0.999 else { fail(String(format: "%@ cos %.7f < 0.999", name, cos)) }
-    }
-
-    // --- per-stage ladder (goldens/bigvgan, dumped by tools/dump_bigvgan_ladder.py) ---
-    // Report-only: stage max_abs drifts benignly vs the Metal-fp16 goldens (the Python
-    // reference itself shows max_abs 0.026 e2e on the CPU stream); a structural break shows
-    // as orders of magnitude (the snake-alias bug read 1.5e0 here). Cosine also reported —
-    // it stays ~1.0 for benign drift. The hard gate is the final waveform cosine below.
-    let ladder = goldensDir.appending(path: "bigvgan")
-    if FileManager.default.fileExists(atPath: ladder.path) {
-        func check(_ name: String, _ ours: MLXArray) throws {
-            let g = try NPY.load(ladder.appending(path: "\(name).npy")).asType(.float32)
-            guard ours.shape == g.shape else { fail("\(name): shape \(ours.shape) vs \(g.shape)") }
-            print(String(format: "  %@ max_abs = %.3e  cos=%.7f",
-                         name.padding(toLength: 18, withPad: " ", startingAt: 0),
-                         maxAbsDiff(ours, g), cosine(ours, g)))
-        }
-
-        print("→ ladder: anti-alias primitive probes")
-        let melL = try NPY.load(goldensDir.appending(path: "core_s2mel_cfm_mel_seed42.npy"))
-            .asType(.float32)[0..., 0..., 431...]
-        var x = model.convPreLayer(melL.transposed(0, 2, 1)).transposed(0, 2, 1)
-        try check("conv_pre", x)
-
-        let probe = try NPY.load(ladder.appending(path: "probe_in.npy")).asType(.float32)
-        let act1d = model.resblockModules[0].activationModules[0]
-        let probeUp = act1d.upsample(probe)
-        try check("probe_upsample", probeUp)
-        try check("probe_act", act1d.applyAct(probeUp))
-        try check("probe_act1d", act1d(probe))
-        try check("probe_downsample", act1d.downsample(probe))
-
-        print("→ ladder: upsample stages")
-        for i in 0 ..< model.numUpsamples {
-            x = model.upsLayers[i](x.transposed(0, 2, 1)).transposed(0, 2, 1)
-            try check("ups_\(i)", x)
-            var xs: MLXArray? = nil
-            for j in 0 ..< model.numKernels {
-                let res = model.resblockModules[i * model.numKernels + j](x)
-                xs = xs.map { $0 + res } ?? res
-            }
-            x = xs! / Float(model.numKernels)
-            try check("stage_\(i)", x)
-        }
-        try check("activation_post", model.activationPostModule(x))
-    }
-
-    print("→ vocoding seed-42 replay mel (trim prompt 431 → (1,80,190))")
-    let melSeed42 = try NPY.load(goldensDir.appending(path: "core_s2mel_cfm_mel_seed42.npy")).asType(.float32)
-    let start = Date()
-    try gate("bigvgan_wav(seed42)", mel: melSeed42, goldenFile: "core_bigvgan_wav_seed42.npy")
-    print(String(format: "  (%.2fs)", Date().timeIntervalSince(start)))
-
-    print("→ vocoding ORIGINAL Stage-0 mel golden")
-    let melOrig = try NPY.load(goldensDir.appending(path: "core_s2mel_cfm_mel.npy")).asType(.float32)
-    try gate("bigvgan_wav(orig)", mel: melOrig, goldenFile: "core_bigvgan_wav.npy")
-
-    print("P5 GATE PASSED")
-}
-
-// MARK: - P6 gate: full Swift chain vs the Stage-0 (seed-42 replay) WAV
-
-/// Minimal 16-bit PCM mono RIFF writer for the listen check.
 func writeWAV(_ samples: [Float], sampleRate: Int, to url: URL) throws {
     var data = Data()
-    func append(_ s: String) { data.append(s.data(using: .ascii)!) }
-    func append32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
-    func append16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
-
-    let dataBytes = UInt32(samples.count * 2)
-    append("RIFF"); append32(36 + dataBytes); append("WAVE")
-    append("fmt "); append32(16); append16(1); append16(1)
-    append32(UInt32(sampleRate)); append32(UInt32(sampleRate * 2)); append16(2); append16(16)
-    append("data"); append32(dataBytes)
-    for s in samples {
-        let clamped = max(-1.0, min(1.0, s))
-        append16(UInt16(bitPattern: Int16(clamped * 32767.0)))
-    }
+    func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+    func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+    let pcm = samples.map { Int16(max(-32768, min(32767, ($0 * 32767).rounded()))) }
+    data.append(contentsOf: Array("RIFF".utf8)); u32(UInt32(36 + pcm.count * 2))
+    data.append(contentsOf: Array("WAVE".utf8)); data.append(contentsOf: Array("fmt ".utf8))
+    u32(16); u16(1); u16(1); u32(UInt32(sampleRate)); u32(UInt32(sampleRate * 2)); u16(2); u16(16)
+    data.append(contentsOf: Array("data".utf8)); u32(UInt32(pcm.count * 2))
+    for v in pcm { u16(UInt16(bitPattern: v)) }
     try data.write(to: url)
 }
 
-func gateP6() throws {
+// MARK: - tok: tiktoken + frontend (the XCTest fixture, re-run here against the weights dir)
+
+func gateTok() throws {
+    let vocab = weightsDir.appending(path: IndexTTS2Generator.tokenizerFile)
+    let tokenizer = try TiktokenBPE(vocabularyURL: vocab)
+    let frontend = IndexTTSTextFrontend(tokenizer: tokenizer)
+    struct F: Codable { let language: String; let text: String; let token_ids: [[Int]]; let raw_bpe_ids: [Int]; let max_text_tokens_per_segment: Int? }
+    struct B: Codable { let text: String; let ids: [Int] }
+    struct Fix: Codable { let frontend: [F]; let bpe: [B] }
+    let fix = try JSONDecoder().decode(Fix.self, from: Data(contentsOf: goldensDir.appending(path: "text_fixtures.json")))
+    var exact = 0, gaps: [String] = []
+    for b in fix.bpe {
+        guard tokenizer.encode(b.text) == b.ids else { fail("bpe mismatch: \(b.text.debugDescription)") }
+        exact += 1
+    }
+    for f in fix.frontend {
+        guard tokenizer.encode(f.text) == f.raw_bpe_ids else { fail("raw bpe mismatch: \(f.text.debugDescription)") }
+        let prepared = try frontend.prepare(f.text, language: IndexTTSLanguage(rawValue: f.language)!,
+                                            maxTokensPerSegment: f.max_text_tokens_per_segment ?? 120)
+        if prepared.tokenIDs == f.token_ids { exact += 1 } else { gaps.append(f.text) }
+    }
+    print("  vocab \(tokenizer.vocabularySize)  bpe \(fix.bpe.count)/\(fix.bpe.count) exact  frontend \(fix.frontend.count - gaps.count)/\(fix.frontend.count) exact")
+    for g in gaps { print("  gap (WeText digit expansion, documented): \(g)") }
+    let digitGaps = gaps.filter { $0.unicodeScalars.contains { CharacterSet.decimalDigits.contains($0) } }
+    guard digitGaps.count == gaps.count else { fail("non-digit frontend mismatch: \(gaps)") }
+    print("TOK GATE PASSED")
+}
+
+// MARK: - ref: reference conditioning chain (fp32 CPU)
+
+func gateRef() throws {
     Device.setDefault(device: Device(.cpu))
+    let g = try loadGenerator(fp32: true)
+    let wav16 = try golden("audio_16k")
+    let wav22 = try golden("audio_22k")
 
-    func golden(_ name: String) throws -> MLXArray {
-        try NPY.load(goldensDir.appending(path: name)).asType(.float32)
-    }
-    var stageCos: [(String, Float)] = []
-    func report(_ name: String, _ ours: MLXArray, _ goldenFile: String) throws {
-        let g = try golden(goldenFile)
-        guard ours.shape == g.shape else {
-            fail("\(name): shape \(ours.shape) vs golden \(g.shape)")
-        }
-        let cos = cosine(ours, g)
-        stageCos.append((name, cos))
-        print(String(format: "  %@ cos=%.7f max_abs=%.5f",
-                     name.padding(toLength: 18, withPad: " ", startingAt: 0),
-                     cos, maxAbsDiff(ours, g)))
-    }
+    guard let (features, mask) = SeamlessFeatureExtractor.callAsFeatures(wav16) else { fail("audio too short") }
+    check("seamless features", features, try golden("seamless_input_features"), cosMin: 0.99999, madMax: 2e-3)
+    let goldMaskSum = try golden("seamless_attention_mask").sum().item(Float.self)
+    guard Float(mask.asType(.int32).sum().item(Int32.self)) == goldMaskSum else { fail("mask mismatch") }
+    let (_, hs) = g.w2v(inputFeatures: features, attentionMask: mask)
+    let spk = Wav2Vec2BertModel.semanticTap(hs, mean: g.semanticMean, std: g.semanticStd)
+    eval(spk)
+    check("w2v spk_cond_emb", spk, try golden("spk_cond_emb"), cosMin: 0.9999, madMax: 5e-2)
 
-    // ---- 1. Text: tokenizer (P1, native) ----
-    print("→ [1/6] tokenizer")
-    let tokenizer = try IndexTTSTextTokenizer(
-        vocabURL: goldensDir.appending(path: "tokenizer_vocab.json"))
-    let text = "The quick brown fox jumps over the lazy dog."
-    let ids = tokenizer.encode(text)
-    let idsGolden = try NPY.load(goldensDir.appending(path: "core_gpt_latent__in0.npy"))
-        .asType(.int32).reshaped(-1)
-    eval(idsGolden)
-    let goldenIds = (0 ..< idsGolden.dim(0)).map { Int(idsGolden[$0].item(Int32.self)) }
-    guard ids == goldenIds else { fail("tokenizer ids \(ids) != golden \(goldenIds)") }
-    print("  text_tokens \(ids.count) ids exact ✓")
-    let textTokens = MLXArray(ids.map(Int32.init)).reshaped(1, ids.count)
+    guard let cmn = CampPlusFbank.fbankCMN(wav16) else { fail("audio too short") }
+    check("campplus fbank cmn", cmn, try golden("campplus_fbank_cmn"), cosMin: 0.99999, madMax: 2e-3)
+    let style = g.campplus(cmn.expandedDimensions(axis: 0)); eval(style)
+    check("campplus style", style, try golden("style"), cosMin: 0.9999, madMax: 5e-3)
 
-    // ---- 2. Reference conditioning (P3, native; audio_16k PCM is the input boundary) ----
-    print("→ [2/6] reference conditioning (w2v-BERT → RepCodec → CampPlus)")
-    var wav16k = try golden("frontend/audio_16k.npy")
-    if wav16k.ndim == 2 { wav16k = wav16k[0] }
+    let refMel = RefMel.melSpectrogram(wav22); eval(refMel)
+    check("ref_mel", refMel, try golden("ref_mel"), cosMin: 0.99999, madMax: 5e-3)
 
-    let w2v = Wav2Vec2BertModel()
-    do {
-        let defaultW2V = home.appending(
-            path: ".cache/huggingface/hub/models--facebook--w2v-bert-2.0/snapshots/da985ba0987f70aaeb84a80f2851cfac8c697a7b")
-        let raw = try loadArrays(url: defaultW2V.appending(path: "model.safetensors"))
-        let sanitized = Wav2Vec2BertModel.sanitize(raw).mapValues { $0.asType(.float32) }
-        try w2v.update(parameters: ModuleParameters.unflattened(sanitized), verify: .all)
-        eval(w2v)
-    }
-    guard let (features, mask) = SeamlessFeatureExtractor.callAsFeatures(wav16k) else {
-        fail("feature extraction failed")
-    }
-    let (_, hs) = w2v(inputFeatures: features, attentionMask: mask)
-    let semanticMean = try golden("w2vbert/semantic_mean.npy")
-    let semanticStd = try golden("w2vbert/semantic_std.npy")
-    let spkCondEmb = Wav2Vec2BertModel.semanticTap(hs, mean: semanticMean, std: semanticStd)
-    eval(spkCondEmb)
-    try report("spk_cond_emb", spkCondEmb, "frontend_ref__spk_cond_emb.npy")
-
-    let repcodec = RepCodec()
-    do {
-        let defaultMGC = home.appending(
-            path: ".cache/huggingface/hub/models--amphion--MaskGCT/snapshots/265c6cef07625665d0c28d2faafb1415562379dc/semantic_codec")
-        let raw = try loadArrays(url: defaultMGC.appending(path: "model.safetensors"))
-        let sanitized = RepCodec.sanitize(raw).mapValues { $0.asType(.float32) }
-        try repcodec.update(parameters: ModuleParameters.unflattened(sanitized), verify: .all)
-        eval(repcodec)
-    }
-    let (_, sRef) = repcodec.quantize(spkCondEmb)
-    eval(sRef)
-    try report("S_ref", sRef, "frontend_ref__S_ref.npy")
-
-    let campplus = CAMPPlus()
-    campplus.train(false)
-    do {
-        let raw = try loadArrays(
-            url: home.appending(path: "Development/_indextts2-oracle/campplus_cn_common.safetensors"))
-        let sanitized = CAMPPlus.sanitize(raw).mapValues { $0.asType(.float32) }
-        try campplus.update(parameters: ModuleParameters.unflattened(sanitized), verify: .all)
-        eval(campplus)
-    }
-    guard let cmn = CampPlusFbank.fbankCMN(wav16k) else { fail("campplus fbank failed") }
-    let style = campplus(cmn[.newAxis, 0..., 0...])
-    eval(style)
-    try report("style", style, "frontend_ref__style.npy")
-
-    // ---- 3. GPT conditioning + teacher-forced latent (P2/P3b, native) ----
-    print("→ [3/6] GPT conditioning + teacher-forced latent")
-    let gpt = try loadUnifiedVoiceV2()
-    let spkNCL = spkCondEmb.transposed(0, 2, 1)
-    let speechCond = gpt.getConditioning(spkNCL)
-    let baseEmovec = gpt.getEmovec(spkNCL)
-    // emotion 'happy' α=0.6 blend; emovec_mat (feat2 emo_matrix) is still oracle-side (E12/Stage 2)
-    let emovecMat = try golden("frontend_emovec_mat.npy")
-    let emoVec = emovecMat + 0.4 * baseEmovec
-    let conditioning = gpt.prepareConditioningLatents(
-        speechConditioning: speechCond, emoVec: emoVec, batchSize: 1)
-    eval(conditioning)
-    try report("conditioning", conditioning, "core_gpt_conditioning.npy")
-
-    let melCodes = try NPY.load(goldensDir.appending(path: "core_gpt_latent__in1.npy"))
-    let gptLatent = gpt.forwardLatent(
-        conditioning: conditioning, textTokens: textTokens, melCodes: melCodes)
-    eval(gptLatent)
-    try report("gpt_latent", gptLatent, "core_gpt_latent.npy")
-
-    // ---- 4. S2Mel (P4, native; ref_mel golden injected — torch mel_fn is un-ported front-end) ----
-    print("→ [4/6] S2Mel")
-    let s2mel = try loadS2Mel()
-    let refMel = try golden("frontend_ref__ref_mel.npy")
-
-    // prompt_condition natively from S_ref (generate_v2 does this in the reference cache)
-    let promptCondition = s2mel.lengthRegulatorModule(sRef, ylens: MLXArray([Int32(refMel.dim(2))]))
-    eval(promptCondition)
-    try report("prompt_condition", promptCondition, "frontend_ref__prompt_condition.npy")
-
-    let gptlayerOut = s2mel.gptLayerModule(gptLatent)
-    eval(gptlayerOut)
-    try report("s2mel_gptlayer", gptlayerOut, "core_s2mel_gptlayer.npy")
-
-    let vq2emb = Vq2Emb()
-    do {
-        let raw = try loadArrays(url: weightsDir.appending(path: "vq2emb.safetensors"))
-        let sanitized = Vq2Emb.sanitize(raw).mapValues { $0.asType(.float32) }
-        try vq2emb.update(parameters: ModuleParameters.unflattened(sanitized), verify: .all)
-        eval(vq2emb)
-    }
-    let sInferNCL = vq2emb(melCodes)
-    eval(sInferNCL)
-    try report("vq2emb", sInferNCL, "core_vq2emb.npy")
-
-    let sInfer = sInferNCL.transposed(0, 2, 1) + gptlayerOut
-    let codeLen = melCodes.dim(1)
-    let cond = s2mel.lengthRegulatorModule(sInfer, ylens: MLXArray([Int32(Float(codeLen) * 1.72)]))
-    eval(cond)
-    try report("lenreg", cond, "core_s2mel_lenreg__0.npy")
-
-    let catCondition = concatenated([promptCondition, cond], axis: 1)
-    let xLens = MLXArray([Int32(catCondition.dim(1))])
-    let zGolden = try golden("core_s2mel_cfm_z_seed42.npy")
-    print("  CFM 25 steps (injected seed-42 z; native seed(42) draw matches to 4.8e-7)…")
-    let mel = s2mel.cfmModule.inference(
-        mu: catCondition, xLens: xLens, prompt: refMel, style: style,
-        nTimesteps: 25, temperature: 1.0, inferenceCfgRate: 0.7, injectedZ: zGolden)
-    eval(mel)
-    try report("cfm_mel", mel, "core_s2mel_cfm_mel_seed42.npy")
-
-    // ---- 5. BigVGAN (P5, native) ----
-    print("→ [5/6] BigVGAN v2")
-    let bigvgan = try loadBigVGAN()
-    let wav = bigvgan(mel[0..., 0..., refMel.dim(2)...])
-    eval(wav)
-    try report("bigvgan_wav", wav, "core_bigvgan_wav_seed42.npy")
-
-    // ---- 6. Post-processing + quantified audio metrics ----
-    print("→ [6/6] audio metrics vs golden (22050 Hz)")
-    var audio = wav[0, 0]
-    let peak = MLX.abs(audio).max().item(Float.self)
-    if peak > 1.0 { audio = audio / max(peak, 1e-6) }
-    audio = clip(audio, min: -0.99, max: 0.99)
-    eval(audio)
-    try report("e2e_audio", audio, "e2e_audio_seed42.npy")
-
-    let n = audio.dim(0)
-    let rms = sqrt(mean(audio * audio)).item(Float.self)
-    let dbfs = 20 * log10(max(rms, 1e-12))
-    let gAudio = try golden("e2e_audio_seed42.npy")
-    let gRms = sqrt(mean(gAudio * gAudio)).item(Float.self)
-    print(String(format: "  %d samples (%.2fs)  RMS=%.4f (golden %.4f)  dBFS=%.1f (golden %.1f)",
-                 n, Float(n) / 22050.0, rms, gRms, dbfs, 20 * log10(max(gRms, 1e-12))))
-
-    var samples = [Float](repeating: 0, count: n)
-    for i in 0 ..< n { samples[i] = audio[i].item(Float.self) }
-    let wavURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        .appending(path: "PORTING/p6_e2e_seed42.wav")
-    try writeWAV(samples, sampleRate: 22050, to: wavURL)
-    print("  wrote \(wavURL.path)")
-
-    print("\n  per-stage summary:")
-    for (name, cos) in stageCos {
-        print(String(format: "    %@ %.7f", name.padding(toLength: 18, withPad: " ", startingAt: 0), cos))
-    }
-
-    // Gate calibration: every stage is held to cos ≥0.999, but the final WAVEFORM cosine is a
-    // chaotic metric through BigVGAN's 36 snake stacks — the PYTHON vocoder itself lands at
-    // cos 0.9945 for a 9e-4 relative mel perturbation (the size of the native-chain mel drift)
-    // and 0.96 at 3e-3. The Swift e2e wav (cos ~0.979) is spectrally identical to the golden:
-    // |STFT| cos 0.9998, log|STFT| cos 0.9996, RMS within 0.2 dB. Gate = stages ≥0.999 +
-    // wav cos ≥0.97 + dBFS within 1 dB.
-    for (name, cos) in stageCos where name != "bigvgan_wav" && name != "e2e_audio" {
-        guard cos >= 0.999 else { fail(String(format: "stage %@ cos %.7f < 0.999", name, cos)) }
-    }
-    let final = stageCos.last!.1
-    guard final >= 0.97 else { fail(String(format: "e2e audio cos %.7f < 0.97", final)) }
-    guard abs(dbfs - 20 * log10(max(gRms, 1e-12))) < 1.0 else { fail("dBFS off by ≥1 dB") }
-    print("P6 GATE PASSED")
+    // Use the GOLDEN upstream tensors below so each stage is judged on its own numerics.
+    let spkG = try golden("spk_cond_emb"), styleG = try golden("style")
+    let prompt = g.s2mel.lengthRegulatorModule(spkG, ylens: MLXArray([Int32(refMel.dim(2))])); eval(prompt)
+    check("prompt_condition (LR)", prompt, try golden("prompt_condition"), cosMin: 0.99999, madMax: 1e-3)
+    let emovec = g.gpt.getEmovec(spkG.transposed(0, 2, 1)); eval(emovec)
+    check("base_emovec", emovec, try golden("base_emovec"), cosMin: 0.9999, madMax: 2e-2)
+    let proj = g.gpt.spkEmbProj(styleG); eval(proj)
+    check("spk_emb_proj", proj, try golden("spk_emb_proj"), cosMin: 0.99999, madMax: 1e-3)
+    let cond = g.gpt.prepareConditioningLatents(style: styleG, emoVec: try golden("base_emovec")); eval(cond)
+    check("conditioning", cond, try golden("conditioning"), cosMin: 0.99999, madMax: 1e-3)
+    var weights = [Float](repeating: 0, count: 8); weights[0] = 0.6
+    let mat = EmotionPresets.emovecMat(weights: weights, style: styleG); eval(mat)
+    check("emovec_mat happy 0.6", mat, try golden("emovec_mat_happy06"), cosMin: 0.999999, madMax: 1e-4)
+    let blend = EmotionPresets.blend(weights: weights, style: styleG, baseEmovec: try golden("base_emovec")); eval(blend)
+    check("emovec blend", blend, try golden("emovec_happy06"), cosMin: 0.999999, madMax: 1e-4)
+    print("REF GATE PASSED")
 }
 
-// MARK: - P7 gate: AR sampling loop
+// MARK: - gpt: language-fused inputs, teacher-forced logits, greedy rollout (fp32 CPU)
 
-// Gate doctrine (exact-match ceiling): sampled sequences are NOT gated token-exact across
-// backends — AR amplifies knife-edge flips. Gates: (a) greedy (temp=0) short run token-exact
-// vs the oracle's fp32-CPU capture (tools/dump_ar_greedy.py), (b) step-0 raw logits
-// cos ≥ 0.9999, (c) seeded sampling produces valid codes (stop emitted, sane length) whose
-// e2e WAV is non-silent and speech-like (dBFS in range).
-func gateP7AR() throws {
+func gateGPT() throws {
     Device.setDefault(device: Device(.cpu))
-    let ar = goldensDir.appending(path: "ar")
+    let g = try loadGenerator(fp32: true)
+    let text = try JSONDecoder().decode(GoldenText.self, from: Data(contentsOf: goldensDir.appending(path: "gpt_text_tokens.json")))
+    let cond = try golden("conditioning")
+    let inputEmb = g.gpt.prepareInputs(conditioning: cond, textTokens: text.token_ids, languageID: text.language_id)
+    eval(inputEmb)
+    // The oracle left-pads one masked zero row; ours has none — compare the tail.
+    let goldEmb = try golden("gpt_input_emb")
+    let pad = goldEmb.dim(1) - inputEmb.dim(1)
+    guard pad >= 0 else { fail("input_emb longer than golden (\(inputEmb.dim(1)) vs \(goldEmb.dim(1)))") }
+    check("gpt input_emb (unpadded)", inputEmb, goldEmb[0..., pad..., 0...], cosMin: 0.999999, madMax: 1e-4)
 
-    print("→ building UnifiedVoiceV2 + loading gpt.safetensors")
-    let model = try loadUnifiedVoiceV2()
+    let codes = try goldenInts("gpt_greedy_codes")
+    // Teacher-forced: [cond, text, mel-start, codes] in one prefill → logits over mel positions.
+    let melSeq = MLXArray(([g.gpt.config.startMelToken] + codes).map(Int32.init)).expandedDimensions(axis: 0)
+    let melEmb = g.gpt.melEmbedding(melSeq) + g.gpt.melPosEmbedding(melSeq)
+    let (hidden, _) = g.gpt.gpt(concatenated([inputEmb, melEmb], axis: 1))
+    let logits = g.gpt.melHead(g.gpt.finalNorm(hidden[0..., inputEmb.dim(1)..., 0...])); eval(logits)
+    check("teacher-forced logits", logits, try golden("gpt_teacher_forced_logits"), cosMin: 0.9999, madMax: 0.5)
+    check("step-0 logits", logits[0, 0], try golden("gpt_step0_logits")[0], cosMin: 0.9999, madMax: 0.5)
 
-    let conditioning = try NPY.load(goldensDir.appending(path: "core_gpt_conditioning.npy")).asType(.float32)
-    let textTokens = try NPY.load(goldensDir.appending(path: "core_gpt_latent__in0.npy"))
+    // Greedy rollout — token-exact.
+    let result = g.gpt.generateMelCodes(conditioning: cond, textTokens: text.token_ids, languageID: text.language_id,
+                                        maxMelTokens: 400, temperature: 0, topK: 0, topP: 1.0, repetitionPenalty: 1.0)
+    let matched = zip(result.melCodes, codes).prefix { $0 == $1 }.count
+    print("  greedy rollout: \(result.melCodes.count) codes (golden \(codes.count)), stopped=\(result.stopped), prefix match \(matched)")
+    guard result.melCodes == codes, result.stopped else { fail("greedy rollout not token-exact") }
+    print("GPT GATE PASSED")
+}
 
-    // --- (a)+(b): greedy short run — token-exact + logits ladder ---
-    print("→ greedy run (temp 0, rep 10.0, cap 300) vs oracle fp32-CPU capture")
-    var stepLogits: [Int: MLXArray] = [:]
-    var start = Date()
-    let greedy = model.generateMelCodes(
-        conditioning: conditioning, textTokens: textTokens, maxMelTokens: 300,
-        temperature: 0, topK: 30, topP: 0.8, repetitionPenalty: 10.0,
-        stepLogitsHook: { i, logits in
-            if i < 8 { stepLogits[i] = logits[0..., 0, 0...].asType(.float32) }
-        })
-    let greedyTime = Date().timeIntervalSince(start)
-    print(String(format: "  %d tokens, stopped=%@ (%.1fs, %.0f ms/token)",
-                 greedy.melCodes.count, String(greedy.stopped), greedyTime,
-                 1000 * greedyTime / Double(greedy.melCodes.count + 1)))
+// MARK: - codec: EnhancedCodec decode (fp32 CPU)
 
-    let logits0Golden = try NPY.load(ar.appending(path: "ar_step0_logits.npy")).asType(.float32)
-    let cos0 = cosine(stepLogits[0]!, logits0Golden)
-    print(String(format: "  step-0 logits cos=%.7f max_abs=%.5f", cos0,
-                 maxAbsDiff(stepLogits[0]!, logits0Golden)))
-    for i in 1 ..< 8 {
-        let file = ar.appending(path: String(format: "ar_greedy_logits_%02d.npy", i))
-        guard FileManager.default.fileExists(atPath: file.path), let mine = stepLogits[i] else { continue }
-        let g = try NPY.load(file).asType(.float32)
-        print(String(format: "  step-%d logits cos=%.7f (report-only)", i, cosine(mine, g)))
-    }
-    guard cos0 >= 0.9999 else { fail(String(format: "step-0 logits cos %.7f < 0.9999", cos0)) }
+func gateCodec() throws {
+    Device.setDefault(device: Device(.cpu))
+    let g = try loadGenerator(fp32: true)
+    let codes = MLXArray(try goldenInts("codes_compressed").map(Int32.init)).expandedDimensions(axis: 0)
+    let vq = g.codec.vq2emb(codes); eval(vq)
+    check("codec vq2emb", vq, try golden("codec_vq2emb"), cosMin: 0.999999, madMax: 1e-4)
+    let s = g.codec(codes); eval(s)
+    check("codec S_infer", s, try golden("codec_s_infer"), cosMin: 0.99999, madMax: 5e-3)
+    print("CODEC GATE PASSED")
+}
 
-    let goldenTokensArr = try NPY.load(ar.appending(path: "ar_greedy_tokens.npy")).asType(.int32)
-    eval(goldenTokensArr)
-    let goldenTokens = (0 ..< goldenTokensArr.dim(0)).map { Int(goldenTokensArr[$0].item(Int32.self)) }
-    guard greedy.stopped else { fail("greedy run did not emit stop token (oracle did)") }
-    if greedy.melCodes == goldenTokens {
-        print("  greedy tokens \(greedy.melCodes.count)/\(goldenTokens.count) EXACT ✓")
-    } else {
-        let n = min(greedy.melCodes.count, goldenTokens.count)
-        let firstDiff = (0 ..< n).first { greedy.melCodes[$0] != goldenTokens[$0] } ?? n
-        fail("greedy tokens diverge at step \(firstDiff) "
-             + "(ours \(greedy.melCodes.count) vs golden \(goldenTokens.count) tokens)")
-    }
+// MARK: - s2mel: length regulator → CFM (seed 42) → BigVGAN (fp32 CPU)
 
-    // --- (c): seeded sampling validity + e2e WAV ---
-    print("→ seeded sampling (seed 42; temp 0.8, top_k 30, top_p 0.8, rep 10.0)")
+func gateS2Mel() throws {
+    Device.setDefault(device: Device(.cpu))
+    let g = try loadGenerator(fp32: true)
+    let sInfer = try golden("codec_s_infer")
+    let target = Int(Double(sInfer.dim(1)) * 1.72)
+    let cond = g.s2mel.lengthRegulatorModule(sInfer, ylens: MLXArray([Int32(target)])); eval(cond)
+    check("lenreg cond", cond, try golden("lenreg_cond"), cosMin: 0.99999, madMax: 2e-3)
+
+    let prompt = try golden("prompt_condition"), refMel = try golden("ref_mel"), style = try golden("style")
+    let combined = concatenated([prompt, try golden("lenreg_cond")], axis: 1)
     MLXRandom.seed(42)
-    start = Date()
-    let sampled = model.generateMelCodes(
-        conditioning: conditioning, textTokens: textTokens, maxMelTokens: 600,
-        temperature: 0.8, topK: 30, topP: 0.8, repetitionPenalty: 10.0)
-    print(String(format: "  %d raw tokens, stopped=%@ (%.1fs)",
-                 sampled.melCodes.count, String(sampled.stopped),
-                 Date().timeIntervalSince(start)))
-    guard sampled.stopped else { fail("sampled run did not emit stop token within 600") }
-    guard (20 ... 600).contains(sampled.melCodes.count) else {
-        fail("sampled length \(sampled.melCodes.count) not in 20...600")
-    }
-    let maxCode = sampled.melCodes.max() ?? 0
-    guard maxCode < 8192 else { fail("sampled code \(maxCode) out of codebook range") }
-    let codes = compressSilence(sampled.melCodes)
-    print("  compress_silence: \(sampled.melCodes.count) → \(codes.count) codes"
-          + String(format: " (~%.2fs speech)", Double(codes.count) * 1.72 * 256.0 / 22050.0))
-
-    print("→ e2e: forwardLatent → S2Mel → CFM (native z) → BigVGAN")
-    let melCodesArr = MLXArray(codes.map(Int32.init)).reshaped(1, codes.count)
-    let latent = model.forwardLatent(
-        conditioning: conditioning, textTokens: textTokens, melCodes: melCodesArr)
-    eval(latent)
-
-    let s2mel = try loadS2Mel()
-    let vq2emb = Vq2Emb()
-    do {
-        let raw = try loadArrays(url: weightsDir.appending(path: "vq2emb.safetensors"))
-        let sanitized = Vq2Emb.sanitize(raw).mapValues { $0.asType(.float32) }
-        try vq2emb.update(parameters: ModuleParameters.unflattened(sanitized), verify: .all)
-        eval(vq2emb)
-    }
-
-    let gptlayerOut = s2mel.gptLayerModule(latent)
-    let sInfer = vq2emb(melCodesArr).transposed(0, 2, 1) + gptlayerOut
-    let cond = s2mel.lengthRegulatorModule(
-        sInfer, ylens: MLXArray([Int32(Float(codes.count) * 1.72)]))
-
-    let promptCondition = try NPY.load(goldensDir.appending(path: "frontend_ref__prompt_condition.npy")).asType(.float32)
-    let refMel = try NPY.load(goldensDir.appending(path: "frontend_ref__ref_mel.npy")).asType(.float32)
-    let style = try NPY.load(goldensDir.appending(path: "frontend_ref__style.npy")).asType(.float32)
-    let catCondition = concatenated([promptCondition, cond], axis: 1)
-    let mel = s2mel.cfmModule.inference(
-        mu: catCondition, xLens: MLXArray([Int32(catCondition.dim(1))]),
-        prompt: refMel, style: style,
-        nTimesteps: 25, temperature: 1.0, inferenceCfgRate: 0.7)
+    let z = MLXRandom.normal([1, 80, combined.dim(1)]); eval(z)
+    check("cfm z (seed 42)", z, try golden("cfm_z_seed42"), cosMin: 0.999999, madMax: 1e-5)
+    MLXRandom.seed(42)
+    let mel = g.s2mel.cfmModule.inference(mu: combined, xLens: MLXArray([Int32(combined.dim(1))]), prompt: refMel,
+                                          style: style, nTimesteps: 25, temperature: 1.0, inferenceCfgRate: 0.7)
     eval(mel)
-
-    let bigvgan = try loadBigVGAN()
-    let wav = bigvgan(mel[0..., 0..., refMel.dim(2)...])
-    eval(wav)
-
-    var audio = wav[0, 0]
-    let peak = MLX.abs(audio).max().item(Float.self)
-    if peak > 1.0 { audio = audio / max(peak, 1e-6) }
-    audio = clip(audio, min: -0.99, max: 0.99)
-    eval(audio)
-
-    let n = audio.dim(0)
-    let rms = sqrt(mean(audio * audio)).item(Float.self)
-    let dbfs = 20 * log10(max(rms, 1e-12))
-    print(String(format: "  %d samples (%.2fs)  RMS=%.4f  dBFS=%.1f  peak=%.3f",
-                 n, Float(n) / 22050.0, rms, dbfs, peak))
-
-    var samples = [Float](repeating: 0, count: n)
-    for i in 0 ..< n { samples[i] = audio[i].item(Float.self) }
-    let wavURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        .appending(path: "PORTING/p7_sampled_seed42.wav")
-    try writeWAV(samples, sampleRate: 22050, to: wavURL)
-    print("  wrote \(wavURL.path)")
-
-    // Speech-like band: golden run sits at −23 dBFS; sampling variance stays well inside.
-    guard dbfs > -35 && dbfs < -10 else { fail(String(format: "dBFS %.1f outside (−35, −10)", dbfs)) }
-
-    print("P7-AR GATE PASSED")
+    // The 2.5 donor's solver returns x AFTER the final prompt-region re-zero; this port (like the
+    // original donor and upstream) returns it before. The prompt frames are trimmed before the
+    // vocoder either way, so parity is judged on the generated region.
+    let goldMel = try golden("cfm_mel_seed42")
+    check("cfm mel (25 steps, generated)", mel[0..., 0..., refMel.dim(2)...], goldMel[0..., 0..., refMel.dim(2)...],
+          cosMin: 0.9999, madMax: 0.2)
+    let wav = g.bigvgan(try golden("cfm_mel_seed42")[0..., 0..., refMel.dim(2)...]); eval(wav)
+    check("bigvgan wav", wav, try golden("bigvgan_wav_seed42"), cosMin: 0.999, madMax: 0.05)
+    print("S2MEL GATE PASSED")
 }
 
-/// |STFT|-magnitude cosine between two mono waveforms (n_fft 512, hop 128, hann).
-/// The perceptual-domain metric for vocoder outputs — raw waveform cosine is chaotic
-/// through BigVGAN's snake stacks (P6 calibration), |STFT| magnitude is not.
-func stftMagCosine(_ a: MLXArray, _ b: MLXArray) -> Float {
-    let window = AudioDSP.hannWindow(512, periodic: true)
-    func mag(_ x: MLXArray) -> MLXArray {
-        let padded = AudioDSP.reflectPadded(x.asType(.float32), pad: 256)
-        return AudioDSP.magnitudeSpectrum(
-            AudioDSP.framed(padded, frameLength: 512, hop: 128), window: window)
-    }
-    return cosine(mag(a), mag(b))
-}
+// MARK: - e2e: production dtype on the GPU stream
 
-// MARK: - P7 gate: GPU smoke (full chain + AR loop on the GPU stream)
+func gateE2E() throws {
+    let g = try loadGenerator(fp32: false)
+    let text = try JSONDecoder().decode(GoldenText.self, from: Data(contentsOf: goldensDir.appending(path: "gpt_text_tokens.json")))
+    let wav16 = try golden("audio_16k").asArray(Float.self)
+    let wav22 = try golden("audio_22k").asArray(Float.self)
+    let t0 = Date()
+    let reference = try g.prepareReference(samples16k: wav16, samples22k: wav22)
+    print(String(format: "  reference prepared in %.2fs", Date().timeIntervalSince(t0)))
+    check("style (fp16 GPU)", reference.style, try golden("style"), cosMin: 0.999, madMax: 0.05)
+    check("base_emovec (fp16 GPU)", reference.baseEmovec, try golden("base_emovec"), cosMin: 0.999, madMax: 0.5)
 
-// Watchdog rules honored: weight loads stay CPU-stream (Device.withDefaultDevice(.cpu),
-// eval(model) inside the loaders after the fp32 upcast); every forward runs on the GPU
-// default stream. Goldens are fp16-Metal captures; GPU-fp32 lands in the same ~1e-3
-// noise class as the CPU-fp32 gates, so the same cos thresholds apply (stages ≥0.999,
-// wav ≥0.97). Sampled/greedy AR sequences are validity/report-only on GPU (knife-edge
-// flips vs the CPU capture are expected, not defects).
-func gateP7GPU() throws {
-    print("→ device: GPU stream for forwards; loads pinned to CPU stream")
+    // Greedy chain vs the fp32-CPU golden codes: fp16 Metal is allowed to diverge late
+    // (AR knife-edges), so report the prefix and require a long exact prefix, not identity.
+    let cond = g.gpt.prepareConditioningLatents(style: reference.style, emoVec: reference.baseEmovec)
+    let greedy = g.gpt.generateMelCodes(conditioning: cond, textTokens: text.token_ids, languageID: text.language_id,
+                                        maxMelTokens: 400, temperature: 0, topK: 0, topP: 1.0, repetitionPenalty: 1.0)
+    let goldCodes = try goldenInts("gpt_greedy_codes")
+    let prefix = zip(greedy.melCodes, goldCodes).prefix { $0 == $1 }.count
+    print("  greedy (fp16 GPU): \(greedy.melCodes.count) codes, exact prefix \(prefix)/\(goldCodes.count), stopped=\(greedy.stopped)")
+    guard prefix >= 20, greedy.stopped else { fail("fp16 GPU greedy diverged too early or did not stop") }
 
-    func mb(_ bytes: Int) -> String { String(format: "%.0f MB", Double(bytes) / 1_048_576) }
-    var stageCos: [(String, Float)] = []
-    func report(_ name: String, _ ours: MLXArray, _ goldenFile: String) throws {
-        let g = try NPY.load(goldensDir.appending(path: goldenFile)).asType(.float32)
-        guard ours.shape == g.shape else { fail("\(name): shape \(ours.shape) vs \(g.shape)") }
-        let cos = cosine(ours, g)
-        stageCos.append((name, cos))
-        print(String(format: "  %@ cos=%.7f",
-                     name.padding(toLength: 18, withPad: " ", startingAt: 0), cos))
-    }
-    func timed<T>(_ name: String, _ body: () throws -> T) rethrows -> T {
-        let start = Date()
-        let result = try body()
-        print(String(format: "  [%@ %.2fs]", name, Date().timeIntervalSince(start)))
-        return result
-    }
-
-    // --- Loads (CPU stream) ---
-    let loadStart = Date()
-    let (gpt, s2mel, bigvgan, vq2emb, w2v, repcodec, campplus) =
-        try Device.withDefaultDevice(Device(.cpu)) {
-            () -> (UnifiedVoiceV2, S2Mel, BigVGANV2, Vq2Emb, Wav2Vec2BertModel, RepCodec, CAMPPlus) in
-            let gpt = try loadUnifiedVoiceV2()
-            let s2mel = try loadS2Mel()
-            let bigvgan = try loadBigVGAN()
-            let vq2emb = Vq2Emb()
-            let raw = try loadArrays(url: weightsDir.appending(path: "vq2emb.safetensors"))
-            try vq2emb.update(
-                parameters: ModuleParameters.unflattened(
-                    Vq2Emb.sanitize(raw).mapValues { $0.asType(.float32) }),
-                verify: .all)
-            eval(vq2emb)
-
-            let w2v = Wav2Vec2BertModel()
-            let w2vDir = home.appending(
-                path: ".cache/huggingface/hub/models--facebook--w2v-bert-2.0/snapshots/da985ba0987f70aaeb84a80f2851cfac8c697a7b")
-            let w2vRaw = try loadArrays(url: w2vDir.appending(path: "model.safetensors"))
-            try w2v.update(
-                parameters: ModuleParameters.unflattened(
-                    Wav2Vec2BertModel.sanitize(w2vRaw).mapValues { $0.asType(.float32) }),
-                verify: .all)
-            eval(w2v)
-
-            let repcodec = RepCodec()
-            let mgcDir = home.appending(
-                path: ".cache/huggingface/hub/models--amphion--MaskGCT/snapshots/265c6cef07625665d0c28d2faafb1415562379dc/semantic_codec")
-            let mgcRaw = try loadArrays(url: mgcDir.appending(path: "model.safetensors"))
-            try repcodec.update(
-                parameters: ModuleParameters.unflattened(
-                    RepCodec.sanitize(mgcRaw).mapValues { $0.asType(.float32) }),
-                verify: .all)
-            eval(repcodec)
-
-            let campplus = CAMPPlus()
-            campplus.train(false)
-            let cppRaw = try loadArrays(
-                url: home.appending(path: "Development/_indextts2-oracle/campplus_cn_common.safetensors"))
-            try campplus.update(
-                parameters: ModuleParameters.unflattened(
-                    CAMPPlus.sanitize(cppRaw).mapValues { $0.asType(.float32) }),
-                verify: .all)
-            eval(campplus)
-            return (gpt, s2mel, bigvgan, vq2emb, w2v, repcodec, campplus)
-        }
-    print(String(format: "  loads (CPU stream): %.1fs  resident=%@",
-                 Date().timeIntervalSince(loadStart), mb(Memory.activeMemory)))
-    let residentAfterLoad = Memory.activeMemory
-    Memory.peakMemory = 0  // isolate forward-pass activation peak from load transients
-
-    // --- Front-end (GPU) ---
-    print("→ [1/5] reference conditioning (GPU)")
-    var wav16k = try NPY.load(goldensDir.appending(path: "frontend/audio_16k.npy")).asType(.float32)
-    if wav16k.ndim == 2 { wav16k = wav16k[0] }
-
-    let spkCondEmb = try timed("w2v-BERT") { () -> MLXArray in
-        guard let (features, mask) = SeamlessFeatureExtractor.callAsFeatures(wav16k) else {
-            fail("feature extraction failed")
-        }
-        let (_, hs) = w2v(inputFeatures: features, attentionMask: mask)
-        let mean = try NPY.load(goldensDir.appending(path: "w2vbert/semantic_mean.npy")).asType(.float32)
-        let std = try NPY.load(goldensDir.appending(path: "w2vbert/semantic_std.npy")).asType(.float32)
-        let tap = Wav2Vec2BertModel.semanticTap(hs, mean: mean, std: std)
-        eval(tap)
-        return tap
-    }
-    try report("spk_cond_emb", spkCondEmb, "frontend_ref__spk_cond_emb.npy")
-
-    let sRef = timed("RepCodec") { () -> MLXArray in
-        let (_, s) = repcodec.quantize(spkCondEmb)
-        eval(s)
-        return s
-    }
-    try report("S_ref", sRef, "frontend_ref__S_ref.npy")
-
-    let style = timed("CampPlus") { () -> MLXArray in
-        guard let cmn = CampPlusFbank.fbankCMN(wav16k) else { fail("campplus fbank failed") }
-        let s = campplus(cmn[.newAxis, 0..., 0...])
-        eval(s)
-        return s
-    }
-    try report("style", style, "frontend_ref__style.npy")
-
-    // --- GPT conditioning (GPU) ---
-    print("→ [2/5] GPT conditioning (GPU)")
-    let conditioning = try timed("conditioning") { () -> MLXArray in
-        let spkNCL = spkCondEmb.transposed(0, 2, 1)
-        let speechCond = gpt.getConditioning(spkNCL)
-        let baseEmovec = gpt.getEmovec(spkNCL)
-        let emovecMat = try NPY.load(goldensDir.appending(path: "frontend_emovec_mat.npy")).asType(.float32)
-        let emoVec = emovecMat + 0.4 * baseEmovec
-        let c = gpt.prepareConditioningLatents(
-            speechConditioning: speechCond, emoVec: emoVec, batchSize: 1)
-        eval(c)
-        return c
-    }
-    try report("conditioning", conditioning, "core_gpt_conditioning.npy")
-
-    // --- AR loop (GPU): greedy report + seeded sampled validity ---
-    print("→ [3/5] AR loop (GPU)")
-    let textTokens = try NPY.load(goldensDir.appending(path: "core_gpt_latent__in0.npy"))
-
-    let greedy = timed("greedy AR") {
-        gpt.generateMelCodes(
-            conditioning: conditioning, textTokens: textTokens, maxMelTokens: 300,
-            temperature: 0, topK: 30, topP: 0.8, repetitionPenalty: 10.0)
-    }
-    let goldenTokensArr = try NPY.load(goldensDir.appending(path: "ar/ar_greedy_tokens.npy")).asType(.int32)
-    eval(goldenTokensArr)
-    let goldenTokens = (0 ..< goldenTokensArr.dim(0)).map { Int(goldenTokensArr[$0].item(Int32.self)) }
-    let nCmp = min(greedy.melCodes.count, goldenTokens.count)
-    let prefix = (0 ..< nCmp).first { greedy.melCodes[$0] != goldenTokens[$0] } ?? nCmp
-    print("  greedy: \(greedy.melCodes.count) tokens, stopped=\(greedy.stopped), "
-          + "matches CPU capture through step \(prefix)/\(goldenTokens.count) (report-only)")
-    guard greedy.stopped else { fail("GPU greedy run did not emit stop token") }
-
+    // Full sampled synthesis (seed 42), quantified.
+    var params = IndexTTS2Generator.SynthesisParams()
+    params.maxTextTokensPerSegment = 120
     MLXRandom.seed(42)
-    let sampled = timed("sampled AR") {
-        gpt.generateMelCodes(
-            conditioning: conditioning, textTokens: textTokens, maxMelTokens: 600,
-            temperature: 0.8, topK: 30, topP: 0.8, repetitionPenalty: 10.0)
-    }
-    print("  sampled(seed 42): \(sampled.melCodes.count) raw tokens, stopped=\(sampled.stopped)")
-    guard sampled.stopped, (20 ... 600).contains(sampled.melCodes.count) else {
-        fail("GPU sampled run invalid (stopped=\(sampled.stopped), n=\(sampled.melCodes.count))")
-    }
+    let t1 = Date()
+    let audio = try g.synthesize(text: text.text, reference: reference, language: .en, params: params)
+    let secs = Double(audio.count) / 22050.0
+    print(String(format: "  e2e sampled: %.2fs audio in %.2fs wall (rtf %.2f), %.1f dBFS", secs, Date().timeIntervalSince(t1),
+                 Date().timeIntervalSince(t1) / secs, dbfs(audio)))
+    guard dbfs(audio) > -35, dbfs(audio) < -10, secs > 3, secs < 12 else { fail("e2e audio outside the validity envelope") }
+    try writeWAV(audio, sampleRate: 22050, to: cwd.appending(path: "PORTING/v25_e2e_seed42.wav"))
 
-    // --- Teacher-forced latent + S2Mel + vocoder (GPU), golden-comparable ---
-    print("→ [4/5] teacher-forced latent + S2Mel + BigVGAN (GPU)")
-    let melCodes = try NPY.load(goldensDir.appending(path: "core_gpt_latent__in1.npy"))
-    let gptLatent = timed("forwardLatent") { () -> MLXArray in
-        let l = gpt.forwardLatent(
-            conditioning: conditioning, textTokens: textTokens, melCodes: melCodes)
-        eval(l)
-        return l
-    }
-    try report("gpt_latent", gptLatent, "core_gpt_latent.npy")
+    // The E12 levers: happy preset, 3 s target, 1.3× rate.
+    MLXRandom.seed(42)
+    var happy = [Float](repeating: 0, count: 8); happy[0] = 0.6
+    let happyAudio = try g.synthesize(text: text.text, reference: reference, language: .en, emotionWeights: happy, params: params)
+    print(String(format: "  happy 0.6: %.2fs, %.1f dBFS", Double(happyAudio.count) / 22050.0, dbfs(happyAudio)))
+    try writeWAV(happyAudio, sampleRate: 22050, to: cwd.appending(path: "PORTING/v25_happy_seed42.wav"))
+    MLXRandom.seed(42)
+    let fitted = try g.synthesize(text: text.text, reference: reference, language: .en, targetDurationSeconds: 3.0, params: params)
+    let fittedSecs = Double(fitted.count) / 22050.0
+    print(String(format: "  targetDuration 3.0: %.2fs, %.1f dBFS", fittedSecs, dbfs(fitted)))
+    guard abs(fittedSecs - 3.0) < 0.05 else { fail("targetDuration missed: \(fittedSecs)") }
+    MLXRandom.seed(42)
+    let fast = try g.synthesize(text: text.text, reference: reference, language: .en, speechRate: 1.3, params: params)
+    print(String(format: "  speechRate 1.3: %.2fs (natural %.2fs → expect ≈%.2fs)", Double(fast.count) / 22050.0, secs, secs / 1.3))
 
-    let refMel = try NPY.load(goldensDir.appending(path: "frontend_ref__ref_mel.npy")).asType(.float32)
-    let mel = try timed("S2Mel+CFM") { () -> MLXArray in
-        let promptCondition = s2mel.lengthRegulatorModule(
-            sRef, ylens: MLXArray([Int32(refMel.dim(2))]))
-        let gptlayerOut = s2mel.gptLayerModule(gptLatent)
-        let sInfer = vq2emb(melCodes).transposed(0, 2, 1) + gptlayerOut
-        let codeLen = melCodes.dim(1)
-        let cond = s2mel.lengthRegulatorModule(
-            sInfer, ylens: MLXArray([Int32(Float(codeLen) * 1.72)]))
-        let catCondition = concatenated([promptCondition, cond], axis: 1)
-        let zGolden = try NPY.load(goldensDir.appending(path: "core_s2mel_cfm_z_seed42.npy")).asType(.float32)
-        let m = s2mel.cfmModule.inference(
-            mu: catCondition, xLens: MLXArray([Int32(catCondition.dim(1))]),
-            prompt: refMel, style: style,
-            nTimesteps: 25, temperature: 1.0, inferenceCfgRate: 0.7, injectedZ: zGolden)
-        eval(m)
-        return m
-    }
-    try report("cfm_mel", mel, "core_s2mel_cfm_mel_seed42.npy")
-
-    let wav = timed("BigVGAN") { () -> MLXArray in
-        let w = bigvgan(mel[0..., 0..., refMel.dim(2)...])
-        eval(w)
-        return w
-    }
-    try report("bigvgan_wav", wav, "core_bigvgan_wav_seed42.npy")
-
-    // Pure-vocode diagnostic: golden mel in → GPU vocoder. Isolates the vocoder's own
-    // GPU-fp32-vs-Metal-fp16 backend noise from upstream mel drift (report-only).
-    let goldenMel = try NPY.load(goldensDir.appending(path: "core_s2mel_cfm_mel_seed42.npy")).asType(.float32)
-    let pureVocode = bigvgan(goldenMel[0..., 0..., refMel.dim(2)...])
-    eval(pureVocode)
-    let goldenWav = try NPY.load(goldensDir.appending(path: "core_bigvgan_wav_seed42.npy")).asType(.float32)
-    print(String(format: "  pure-vocode(golden mel): raw cos=%.7f  |STFT| cos=%.7f (report-only)",
-                 cosine(pureVocode, goldenWav),
-                 stftMagCosine(pureVocode[0, 0], goldenWav[0, 0])))
-
-    let stftCos = stftMagCosine(wav[0, 0], goldenWav[0, 0])
-    print(String(format: "  bigvgan_wav |STFT| cos=%.7f", stftCos))
-
-    // --- Metrics + memory ---
-    print("→ [5/5] audio metrics + memory")
-    var audio = wav[0, 0]
-    let peak = MLX.abs(audio).max().item(Float.self)
-    if peak > 1.0 { audio = audio / max(peak, 1e-6) }
-    audio = clip(audio, min: -0.99, max: 0.99)
-    eval(audio)
-    let rms = sqrt(mean(audio * audio)).item(Float.self)
-    let dbfs = 20 * log10(max(rms, 1e-12))
-    print(String(format: "  RMS=%.4f  dBFS=%.1f", rms, dbfs))
-    print("  resident(after load)=\(mb(residentAfterLoad))  "
-          + "peak(forwards)=\(mb(Memory.peakMemory))  "
-          + "active=\(mb(Memory.activeMemory))  cache=\(mb(Memory.cacheMemory))")
-
-    print("\n  per-stage summary (GPU-fp32 vs fp16-Metal goldens):")
-    for (name, cos) in stageCos {
-        print(String(format: "    %@ %.7f", name.padding(toLength: 18, withPad: " ", startingAt: 0), cos))
-    }
-    for (name, cos) in stageCos where name != "bigvgan_wav" {
-        guard cos >= 0.999 else { fail(String(format: "stage %@ cos %.7f < 0.999", name, cos)) }
-    }
-    // Waveform gate = spectral, per the P6 chaos calibration (GPU-fp32 backend noise through
-    // the snake stacks drops RAW wav cos to ~0.95 while |STFT| stays ~1); raw cos keeps only
-    // a structural-break floor (real breaks read ~0.05–0.5, e.g. the P5 aliasing bug).
-    guard stftCos >= 0.999 else { fail(String(format: "bigvgan_wav |STFT| cos %.7f < 0.999", stftCos)) }
-    guard stageCos.last!.1 >= 0.90 else {
-        fail(String(format: "bigvgan_wav raw cos %.7f < 0.90 (structural floor)", stageCos.last!.1))
-    }
-    guard dbfs > -35 && dbfs < -10 else { fail(String(format: "dBFS %.1f outside (−35, −10)", dbfs)) }
-
-    print("P7-GPU GATE PASSED")
+    // A second language through the same clone (zh), validity only.
+    MLXRandom.seed(42)
+    let zh = try g.synthesize(text: "今天的天气真不错，我们一起去公园散步吧。", reference: reference, language: .zh, params: params)
+    print(String(format: "  zh: %.2fs, %.1f dBFS", Double(zh.count) / 22050.0, dbfs(zh)))
+    guard dbfs(zh) > -35, dbfs(zh) < -10 else { fail("zh audio outside the validity envelope") }
+    try writeWAV(zh, sampleRate: 22050, to: cwd.appending(path: "PORTING/v25_zh_seed42.wav"))
+    print("E2E GATE PASSED")
 }
 
-// MARK: - P7 gate: quantization (int8 + int4 on the GPT transformer Linears)
+// MARK: - quant: int8 / int4 GPT backbone on the GPU stream
 
-// Scope mirrors the donor (`nn.quantize(self.gpt.gpt, bits, group_size=64)`): ONLY the
-// GPT2 backbone Linears (gpt.h.*); embeddings / heads / final norms / conditioners /
-// S2Mel / vocoder stay fp32|fp16. ⚠ Quantized matmul is Metal-only: load + quantize run
-// on the CPU stream, every FORWARD runs on the GPU stream (a CPU-pinned quant forward
-// silently grinds for hours). The ~1e-3 GPU-vs-golden fp32 noise is absorbed by the
-// cosine gates: gpt_latent int8 ≥ 0.9999, int4 ≥ 0.99, + e2e WAV validity + memory delta.
-func gateP7Quant() throws {
-    func mb(_ bytes: Int) -> String { String(format: "%.0f MB", Double(bytes) / 1_048_576) }
-
-    let conditioning = try NPY.load(goldensDir.appending(path: "core_gpt_conditioning.npy")).asType(.float32)
-    let textTokens = try NPY.load(goldensDir.appending(path: "core_gpt_latent__in0.npy"))
-    let melCodes = try NPY.load(goldensDir.appending(path: "core_gpt_latent__in1.npy"))
-    let goldenLatent = try NPY.load(goldensDir.appending(path: "core_gpt_latent.npy")).asType(.float32)
-
-    // fp32 downstream chain (unquantized scope), loaded once on the CPU stream.
-    print("→ loading fp32 S2Mel + Vq2Emb + BigVGAN (CPU stream; quant scope excludes them)")
-    let (s2mel, bigvgan, vq2emb) = try Device.withDefaultDevice(Device(.cpu)) {
-        () -> (S2Mel, BigVGANV2, Vq2Emb) in
-        let s2mel = try loadS2Mel()
-        let bigvgan = try loadBigVGAN()
-        let vq2emb = Vq2Emb()
-        let raw = try loadArrays(url: weightsDir.appending(path: "vq2emb.safetensors"))
-        try vq2emb.update(
-            parameters: ModuleParameters.unflattened(
-                Vq2Emb.sanitize(raw).mapValues { $0.asType(.float32) }),
-            verify: .all)
-        eval(vq2emb)
-        return (s2mel, bigvgan, vq2emb)
-    }
-    let refMel = try NPY.load(goldensDir.appending(path: "frontend_ref__ref_mel.npy")).asType(.float32)
-    let promptCondition = try NPY.load(goldensDir.appending(path: "frontend_ref__prompt_condition.npy")).asType(.float32)
-    let style = try NPY.load(goldensDir.appending(path: "frontend_ref__style.npy")).asType(.float32)
-
-    for (bits, cosMin) in [(8, Float(0.9999)), (4, Float(0.99))] {
-        print("→ int\(bits): load fp32 + quantize gpt.h.* Linears (CPU stream)")
-        var residentBefore = 0
-        var residentAfter = 0
-        let model = try Device.withDefaultDevice(Device(.cpu)) { () -> UnifiedVoiceV2 in
-            let m = try loadUnifiedVoiceV2()
-            residentBefore = Memory.activeMemory
-            quantize(model: m, groupSize: 64, bits: bits) { path, module in
-                path.hasPrefix("gpt.h.") && module is Linear
-            }
-            eval(m)
-            return m
-        }
-        Memory.clearCache()
-        residentAfter = Memory.activeMemory
-        let nQuantized = model.leafModules().flattened().filter { $0.1 is Quantized }.count
-        print("  quantized \(nQuantized) Linears; resident \(mb(residentBefore)) → \(mb(residentAfter))"
-              + " (Δ \(mb(residentBefore - residentAfter)))")
-
-        // --- teacher-forced gpt_latent (GPU forward) ---
-        var start = Date()
-        let latent = model.forwardLatent(
-            conditioning: conditioning, textTokens: textTokens, melCodes: melCodes)
-        eval(latent)
-        let cos = cosine(latent, goldenLatent)
-        print(String(format: "  gpt_latent cos=%.7f max_abs=%.5f (%.2fs, GPU)",
-                     cos, maxAbsDiff(latent, goldenLatent), Date().timeIntervalSince(start)))
-        guard cos >= cosMin else {
-            fail(String(format: "int%d gpt_latent cos %.7f < %.4f", bits, cos, cosMin))
-        }
-
-        // --- seeded AR + e2e WAV validity (GPU forwards) ---
+func gateQuant() throws {
+    let text = try JSONDecoder().decode(GoldenText.self, from: Data(contentsOf: goldensDir.appending(path: "gpt_text_tokens.json")))
+    let cond = try golden("conditioning")
+    let goldCodes = try goldenInts("gpt_greedy_codes")
+    let goldLogits = try golden("gpt_teacher_forced_logits")
+    let wav16 = try golden("audio_16k").asArray(Float.self)
+    let wav22 = try golden("audio_22k").asArray(Float.self)
+    for bits in [8, 4] {
+        let g = try loadGenerator(fp32: false, quantBits: bits)
+        let inputEmb = g.gpt.prepareInputs(conditioning: cond, textTokens: text.token_ids, languageID: text.language_id)
+        let melSeq = MLXArray(([g.gpt.config.startMelToken] + goldCodes).map(Int32.init)).expandedDimensions(axis: 0)
+        let melEmb = g.gpt.melEmbedding(melSeq) + g.gpt.melPosEmbedding(melSeq)
+        let (hidden, _) = g.gpt.gpt(concatenated([inputEmb, melEmb], axis: 1))
+        let logits = g.gpt.melHead(g.gpt.finalNorm(hidden[0..., inputEmb.dim(1)..., 0...])); eval(logits)
+        let cos = cosine(logits, goldLogits)
+        let greedy = g.gpt.generateMelCodes(conditioning: cond, textTokens: text.token_ids, languageID: text.language_id,
+                                            maxMelTokens: 400, temperature: 0, topK: 0, topP: 1.0, repetitionPenalty: 1.0)
+        let prefix = zip(greedy.melCodes, goldCodes).prefix { $0 == $1 }.count
+        print(String(format: "  int%d: teacher-forced logits cos=%.6f, greedy prefix %d/%d, %d codes, stopped=%@",
+                     bits, cos, prefix, goldCodes.count, greedy.melCodes.count, greedy.stopped ? "yes" : "no"))
+        guard cos >= (bits == 8 ? 0.999 : 0.99), greedy.stopped else { fail("int\(bits) gate failed") }
+        let reference = try g.prepareReference(samples16k: wav16, samples22k: wav22)
         MLXRandom.seed(42)
-        start = Date()
-        let sampled = model.generateMelCodes(
-            conditioning: conditioning, textTokens: textTokens, maxMelTokens: 600,
-            temperature: 0.8, topK: 30, topP: 0.8, repetitionPenalty: 10.0)
-        print(String(format: "  sampled(seed 42): %d raw tokens, stopped=%@ (%.1fs, %.0f ms/token)",
-                     sampled.melCodes.count, String(sampled.stopped),
-                     Date().timeIntervalSince(start),
-                     1000 * Date().timeIntervalSince(start) / Double(sampled.melCodes.count + 1)))
-        guard sampled.stopped, (20 ... 600).contains(sampled.melCodes.count) else {
-            fail("int\(bits) sampled run invalid (stopped=\(sampled.stopped), n=\(sampled.melCodes.count))")
-        }
-        let codes = compressSilence(sampled.melCodes)
-        let codesArr = MLXArray(codes.map(Int32.init)).reshaped(1, codes.count)
-
-        let qLatent = model.forwardLatent(
-            conditioning: conditioning, textTokens: textTokens, melCodes: codesArr)
-        let sInfer = vq2emb(codesArr).transposed(0, 2, 1) + s2mel.gptLayerModule(qLatent)
-        let cond = s2mel.lengthRegulatorModule(
-            sInfer, ylens: MLXArray([Int32(Float(codes.count) * 1.72)]))
-        let catCondition = concatenated([promptCondition, cond], axis: 1)
-        let mel = s2mel.cfmModule.inference(
-            mu: catCondition, xLens: MLXArray([Int32(catCondition.dim(1))]),
-            prompt: refMel, style: style,
-            nTimesteps: 25, temperature: 1.0, inferenceCfgRate: 0.7)
-        let wav = bigvgan(mel[0..., 0..., refMel.dim(2)...])
-        eval(wav)
-
-        var audio = wav[0, 0]
-        let peak = MLX.abs(audio).max().item(Float.self)
-        if peak > 1.0 { audio = audio / max(peak, 1e-6) }
-        audio = clip(audio, min: -0.99, max: 0.99)
-        eval(audio)
-        let rms = sqrt(mean(audio * audio)).item(Float.self)
-        let dbfs = 20 * log10(max(rms, 1e-12))
-        print(String(format: "  e2e: %d samples (%.2fs)  RMS=%.4f  dBFS=%.1f",
-                     audio.dim(0), Float(audio.dim(0)) / 22050.0, rms, dbfs))
-        guard dbfs > -35 && dbfs < -10 else {
-            fail(String(format: "int%d dBFS %.1f outside (−35, −10)", bits, dbfs))
-        }
-
-        var samples = [Float](repeating: 0, count: audio.dim(0))
-        for i in 0 ..< audio.dim(0) { samples[i] = audio[i].item(Float.self) }
-        let wavURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            .appending(path: "PORTING/p7_int\(bits)_seed42.wav")
-        try writeWAV(samples, sampleRate: 22050, to: wavURL)
-        print("  wrote \(wavURL.path)")
-        print(String(format: "  peak(GPU forwards)=%@", mb(Memory.peakMemory)))
+        let audio = try g.synthesize(text: text.text, reference: reference, language: .en)
+        print(String(format: "  int%d e2e: %.2fs, %.1f dBFS", bits, Double(audio.count) / 22050.0, dbfs(audio)))
+        guard dbfs(audio) > -35, dbfs(audio) < -10 else { fail("int\(bits) e2e audio outside the validity envelope") }
+        try writeWAV(audio, sampleRate: 22050, to: cwd.appending(path: "PORTING/v25_int\(bits)_seed42.wav"))
         Memory.clearCache()
-        print("  int\(bits) PASSED")
     }
-
-    print("P7-QUANT GATE PASSED")
+    print("QUANT GATE PASSED")
 }
 
-// MARK: - Stage-2 gate: ref-mel head + preset-emotion path
+// MARK: - footprint: MLX-active resident floor + run peak for ONE tier (manifest numbers)
+// One tier per process (`--bits 8|4`, default fp16): MLX's peak counter is process-cumulative.
 
-/// Gates the two former injected-golden boundaries closed for Stage 2:
-/// (a) the 22.05 kHz ref-mel head (`RefMel.melSpectrogram`) vs `refmel_ref`/`refmel_synth`
-///     (the oracle recompute is bitwise-identical to Stage-0 `frontend_ref__ref_mel`);
-/// (b) the preset-emotion path (`EmotionPresets`) vs `frontend_emovec_mat` (happy @ α 0.6)
-///     — matrices baked from feat1/feat2.pt by tools/dump_stage2.py.
-func gateStage2Frontend() throws {
-    Device.setDefault(device: Device(.cpu))
-    let s2 = goldensDir.appending(path: "stage2")
-
-    func check(_ name: String, _ ours: MLXArray, _ golden: MLXArray,
-               cosMin: Float, madMax: Float) {
-        let mine = ours.asType(.float32)
-        let gold = golden.asType(.float32)
-        guard mine.shape == gold.shape else {
-            fail("\(name): shape \(mine.shape) vs golden \(gold.shape)")
-        }
-        let cos = cosine(mine, gold)
-        let mad = maxAbsDiff(mine, gold)
-        print(String(format: "  %@  cos=%.7f  max_abs=%.6f", name, cos, mad))
-        if cos < cosMin || mad > madMax {
-            fail(String(format: "%@ gate failed (cos %.7f < %.4f or max_abs %.6f > %.4f)",
-                        name, cos, cosMin, mad, madMax))
-        }
+func gateFootprint() throws {
+    let text = try JSONDecoder().decode(GoldenText.self, from: Data(contentsOf: goldensDir.appending(path: "gpt_text_tokens.json")))
+    let wav16 = try golden("audio_16k").asArray(Float.self)
+    let wav22 = try golden("audio_22k").asArray(Float.self)
+    let long = String(repeating: text.text + " ", count: 3)
+    let bits: Int? = argValue("--bits").flatMap(Int.init)
+    do {
+        let g = try loadGenerator(fp32: false, quantBits: bits)
+        let resident = Memory.activeMemory
+        let reference = try g.prepareReference(samples16k: wav16, samples22k: wav22)
+        MLXRandom.seed(42)
+        let a1 = try g.synthesize(text: text.text, reference: reference, language: .en)
+        let peakShort = Memory.peakMemory
+        let a2 = try g.synthesize(text: long, reference: reference, language: .en)
+        let peakLong = Memory.peakMemory
+        print(String(format: "  [FOOT] tier=%@ resident=%d MB peak(%.1fs)=%d MB peak(%.1fs)=%d MB transient=%d MB",
+                     bits.map { "int\($0)" } ?? "fp16", resident / 1_000_000, Double(a1.count) / 22050, peakShort / 1_000_000,
+                     Double(a2.count) / 22050, peakLong / 1_000_000, (peakLong - resident) / 1_000_000))
     }
-
-    // (a) ref-mel head — ref clip + synth case.
-    for (tag, audioFile, goldenFile) in [("ref", "audio_22k.npy", "refmel_ref.npy"),
-                                         ("synth", "synth_22k.npy", "refmel_synth.npy")] {
-        var wav = try NPY.load(s2.appending(path: audioFile)).asType(.float32)
-        if wav.ndim == 2 { wav = wav[0] }  // (1, T) → (T,)
-        print("→ refmel \(tag): \(wav.dim(0)) samples")
-        let mel = RefMel.melSpectrogram(wav)
-        eval(mel)
-        let golden = try NPY.load(s2.appending(path: goldenFile))
-        check("refmel \(tag)", mel, golden, cosMin: 0.99999, madMax: 5e-3)
-    }
-    // Cross-check vs the Stage-0 pipeline golden directly (same tensor as refmel_ref).
-    let stage0 = try NPY.load(goldensDir.appending(path: "frontend_ref__ref_mel.npy"))
-    var refWav = try NPY.load(s2.appending(path: "audio_22k.npy")).asType(.float32)
-    if refWav.ndim == 2 { refWav = refWav[0] }
-    let stage0Mel = RefMel.melSpectrogram(refWav)
-    eval(stage0Mel)
-    check("refmel vs Stage-0 golden", stage0Mel, stage0, cosMin: 0.99999, madMax: 5e-3)
-
-    // (b) preset-emotion path — happy @ emo_alpha 0.6 (the Stage-0 capture's setting).
-    let style = try NPY.load(goldensDir.appending(path: "frontend_ref__style.npy")).asType(.float32)
-    var weights = [Float](repeating: 0, count: 8)
-    weights[EmotionPresets.categories.firstIndex(of: "happy")!] = 1.0 * 0.6
-    let emovecMat = EmotionPresets.emovecMat(weights: weights, style: style)
-    eval(emovecMat)
-    let goldenEmovec = try NPY.load(goldensDir.appending(path: "frontend_emovec_mat.npy"))
-    check("emovec_mat (happy@0.6)", emovecMat, goldenEmovec, cosMin: 0.999999, madMax: 1e-4)
-
-    // Blend sanity: Σw = 0.6 < 1 ⇒ mat + 0.4·base (the P3b-banked formula).
-    let base = try NPY.load(goldensDir.appending(path: "core_gpt_base_emovec.npy")).asType(.float32)
-    let blended = EmotionPresets.blend(weights: weights, style: style, baseEmovec: base)
-    let manual = emovecMat + 0.4 * base
-    eval(blended, manual)
-    check("emovec blend", blended, manual, cosMin: 0.9999999, madMax: 1e-6)
-
-    print("STAGE2-FRONTEND GATE PASSED")
-}
-
-// MARK: - Stage-2 gate: self-contained production runtime (IndexTTS2Generator)
-
-/// First fully self-contained run: `IndexTTS2Generator.load` (production dtypes — fp16
-/// main checkpoint, no gate-lane fp32 upcast) → native reference conditioning from PCM →
-/// AR sampling → S2Mel → BigVGAN. No injected goldens anywhere. Quantified gates:
-/// dBFS speech band + |STFT| self-consistency across the emotion/duration levers +
-/// duration-lever accuracy (targetDuration lands within 12%).
-func gateStage2Runtime() throws {
-    let s2 = goldensDir.appending(path: "stage2")
-
-    print("→ IndexTTS2Generator.load (production dtypes; CPU-stream loads)")
-    let loadStart = Date()
-    let generator = try IndexTTS2Generator.load(
-        modelDirectory: weightsDir,
-        w2vBertDirectory: home.appending(
-            path: ".cache/huggingface/hub/models--facebook--w2v-bert-2.0/snapshots/da985ba0987f70aaeb84a80f2851cfac8c697a7b"),
-        semanticCodecDirectory: home.appending(
-            path: ".cache/huggingface/hub/models--amphion--MaskGCT/snapshots/265c6cef07625665d0c28d2faafb1415562379dc"))
-    print(String(format: "  loaded in %.1fs  resident=%.0f MB",
-                 Date().timeIntervalSince(loadStart), Double(Memory.activeMemory) / 1_048_576))
-
-    // Pipeline-exact PCM at both rates (the goldens' librosa-mono/resample chain).
-    var wav16k = try NPY.load(goldensDir.appending(path: "frontend/audio_16k.npy")).asType(.float32)
-    if wav16k.ndim == 2 { wav16k = wav16k[0] }
-    var wav22k = try NPY.load(s2.appending(path: "audio_22k.npy")).asType(.float32)
-    if wav22k.ndim == 2 { wav22k = wav22k[0] }
-
-    print("→ prepareReference (native front-end, fp16)")
-    let reference = try generator.prepareReference(
-        samples16k: wav16k.asArray(Float.self), samples22k: wav22k.asArray(Float.self))
-    eval(reference.promptCondition)
-
-    func dbfs(_ samples: [Float]) -> Float {
-        let rms = sqrt(samples.reduce(Float(0)) { $0 + $1 * $1 } / Float(max(samples.count, 1)))
-        return 20 * log10(max(rms, 1e-12))
-    }
-    let text = "The quick brown fox jumps over the lazy dog."
-
-    print("→ synthesize (seed 42, emotion happy@0.6)")
-    MLXRandom.seed(42)
-    var happyWeights = [Float](repeating: 0, count: 8)
-    happyWeights[0] = 0.6
-    var start = Date()
-    let happy = try generator.synthesize(
-        text: text, reference: reference, emotionWeights: happyWeights)
-    let happySeconds = Double(happy.count) / 22050.0
-    print(String(format: "  %.2fs audio in %.1fs  dBFS=%.1f",
-                 happySeconds, Date().timeIntervalSince(start), dbfs(happy)))
-    guard dbfs(happy) > -35 && dbfs(happy) < -10 else {
-        fail(String(format: "happy dBFS %.1f outside (−35, −10)", dbfs(happy)))
-    }
-    try writeWAV(happy, sampleRate: 22050,
-                 to: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                     .appending(path: "PORTING/stage2_happy_seed42.wav"))
-
-    print("→ synthesize (seed 42, reference emotion, targetDuration 3.0 s)")
-    MLXRandom.seed(42)
-    start = Date()
-    let fitted = try generator.synthesize(
-        text: text, reference: reference, targetDurationSeconds: 3.0)
-    let fittedSeconds = Double(fitted.count) / 22050.0
-    print(String(format: "  %.2fs audio (target 3.00)  dBFS=%.1f  (%.1fs)",
-                 fittedSeconds, dbfs(fitted), Date().timeIntervalSince(start)))
-    guard abs(fittedSeconds - 3.0) < 0.36 else {
-        fail(String(format: "targetDuration miss: %.2fs vs 3.00s (>12%%)", fittedSeconds))
-    }
-    guard dbfs(fitted) > -35 && dbfs(fitted) < -10 else {
-        fail(String(format: "fitted dBFS %.1f outside (−35, −10)", dbfs(fitted)))
-    }
-    try writeWAV(fitted, sampleRate: 22050,
-                 to: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                     .appending(path: "PORTING/stage2_duration3s_seed42.wav"))
-
-    print("→ synthesize (seed 42, speechRate 1.3)")
-    MLXRandom.seed(42)
-    let fast = try generator.synthesize(text: text, reference: reference, speechRate: 1.3)
-    let fastSeconds = Double(fast.count) / 22050.0
-    print(String(format: "  %.2fs audio (natural was ~%.2fs ÷1.3 → ~%.2fs expected)",
-                 fastSeconds, happySeconds, happySeconds / 1.3))
-    guard dbfs(fast) > -35 && dbfs(fast) < -10 else {
-        fail(String(format: "fast dBFS %.1f outside (−35, −10)", dbfs(fast)))
-    }
-
-    print("STAGE2-RUNTIME GATE PASSED")
+    print("FOOTPRINT DONE")
 }
 
 // MARK: - Entry
 
-let mode = CommandLine.arguments.dropFirst().first ?? "p2"
+let mode = CommandLine.arguments.dropFirst().first ?? "all"
 do {
     switch mode {
-    case "p2": try gateP2()
-    case "p3fe": try gateP3Frontend()
-    case "p3w2v": try gateP3W2VBert()
-    case "p3mgc": try gateP3MaskGCT()
-    case "p3cpp": try gateP3CampPlus()
-    case "p3cond": try gateP3Conditioners()
-    case "p4": try gateP4()
-    case "p5": try gateP5()
-    case "p6": try gateP6()
-    case "p7ar": try gateP7AR()
-    case "p7gpu": try gateP7GPU()
-    case "p7quant": try gateP7Quant()
-    case "stage2": try gateStage2Frontend()
-    case "stage2e2e": try gateStage2Runtime()
-    default: fail("unknown mode \(mode) (expected: p2 | p3fe | p3w2v | p3mgc | p3cpp | p3cond | p4 | p5 | p6 | p7ar | p7gpu | p7quant | stage2 | stage2e2e)")
+    case "tok": try gateTok()
+    case "ref": try gateRef()
+    case "gpt": try gateGPT()
+    case "codec": try gateCodec()
+    case "s2mel": try gateS2Mel()
+    case "e2e": try gateE2E()
+    case "quant": try gateQuant()
+    case "footprint": try gateFootprint()
+    case "all":
+        try gateTok(); try gateRef(); try gateGPT(); try gateCodec(); try gateS2Mel()
+    default: fail("unknown mode \(mode) (tok | ref | gpt | codec | s2mel | e2e | quant | footprint | all)")
     }
 } catch {
     fail("\(error)")

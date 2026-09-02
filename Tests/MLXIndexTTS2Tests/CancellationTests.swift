@@ -2,7 +2,7 @@
 // CAN-1/2 drive the real run() pre-cancelled (the entry checkpoint fires before notLoaded
 // validation or weights); CAN-3 is the document of record for the checkpoint cadence: the
 // GPT-backbone AR loop bails per generated mel token (`Task.isCancelled` break in
-// UnifiedVoiceV2.generateMelCodes — core folded into this repo), and the throwing `cancelCheck`
+// UnifiedVoiceV25.generateMelCodes — core folded into this repo), and the throwing `cancelCheck`
 // closure the wrapper passes to IndexTTS2Generator.synthesize checkpoints between every pipeline
 // stage (per-segment AR, S2Mel length-regulate, CFM denoise, BigVGAN vocode) and immediately
 // after the AR phase — so a cancel is never laundered into IndexTTS2Error.emptyGeneration.
@@ -39,7 +39,7 @@ final class CancellationTests: XCTestCase {
             manifest: IndexTTS2Package.manifest,
             posture: .cadence([
                 // The GPT AR driver checks Task.isCancelled once per generated mel token
-                // (UnifiedVoiceV2+Generate.swift, generateMelCodes loop — up to 1500/segment).
+                // (UnifiedVoiceV25.swift, generateMelCodes loop — up to 1500/segment).
                 .init(phase: .generate, unit: .token),
                 // The wrapper's throwing cancelCheck closure fires between pipeline stages:
                 // per-segment before AR, post-AR (before the emptyGeneration guard), before

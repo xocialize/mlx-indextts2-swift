@@ -1,19 +1,20 @@
 // swift-tools-version: 6.2
 import PackageDescription
 
-// mlx-indextts2-swift — Swift-MLX port of IndexTTS2 (emotion + duration-controllable TTS),
-// donor: solar2ain/mlx-indextts (MIT, Python-MLX) + our MLX-Python front-end ports
-// (w2v-BERT 2.0, MaskGCT RepCodec) in _indextts2-oracle. Ported phase-by-phase per the
-// mlx-swift-integration parity doctrine; each phase gates against the Stage-0 goldens.
+// mlx-indextts2-swift — Swift-MLX port of IndexTTS-2.5 (multilingual zero-shot cloning TTS with
+// native emotion + duration control). Donor: vanch007/mlx-indextts2 (MIT, Python-MLX, `v25`
+// profile) — the oracle for every golden in PORTING/goldens-v25 (fp32 CPU). The 2.0 tier
+// (non-commercial INDEX_MODEL_LICENSE, MaskGCT/RepCodec + SentencePiece) was removed at the
+// 2.5 update (v0.4.0) — this package ships ONE model.
 //
 // Parity gates live in the `indextts2-gate` CLI lane (NOT XCTest — the SPM test product's
 // metallib is unreliable; `swift run` is the doctrine for gates that touch kernels).
-// XCTest carries the offline checks (tokenizer parity, weight-free key contracts, the
-// Stage-2 manifest + MAT-1..5 materialization gate).
+// XCTest carries the offline checks (tokenizer/frontend parity, weight-free key contracts, the
+// manifest + MAT-1..5 materialization gate, CAN-1..3, INF).
 //
-// Stage 2: `MLXIndexTTS2TTS` is the engine-facing wrapper (IndexTTS2Configuration +
-// IndexTTS2Package) over the `MLXIndexTTS2` core — same split as MLXVoxCPM2TTS/MLXQwen3TTS.
-// The core stays MLXToolKit-free. Engine contract pinned ≥0.23.0 (LicenseRef-Index-Model).
+// `MLXIndexTTS2TTS` is the engine-facing wrapper (IndexTTS2Configuration + IndexTTS2Package)
+// over the `MLXIndexTTS2` core — same split as MLXMossTTS. The core stays MLXToolKit-free.
+// Engine contract pinned ≥0.51.0 (SPDXLicense.bilibiliModelUse on the permissive allowlist).
 let package = Package(
     name: "mlx-indextts2-swift",
     platforms: [
@@ -28,13 +29,9 @@ let package = Package(
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
         // Shared STFT/mel primitives.
         .package(url: "https://github.com/xocialize/mlx-audio-dsp.git", from: "0.1.0"),
-        // Engine contract — ≥0.28.1 for Specialty.voiceClone (IndexTTS2's zero-shot
-        // cloning selection axis); 0.27.0 brought the CAN cancellation-conformance gate
-        // (MLXServeConformance.CancellationConformance); 0.23.0 brought
-        // LicenseRef-Index-Model + emotionControl/durationControl.
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.36.0"),
-        // Native downloader for WeightSourcing auto-materialization.
-        .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
+        // Engine contract — ≥0.51.0 for SPDXLicense.bilibiliModelUse (the IndexTTS-2.5
+        // weight license, allowlisted); the engine executes materialization (≥0.32.0).
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.51.0"),
     ],
     targets: [
         .target(
@@ -64,7 +61,6 @@ let package = Package(
                 .product(name: "MLXToolKit", package: "mlx-engine-swift"),
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXAudioDSP", package: "mlx-audio-dsp"),
-                .product(name: "HuggingFace", package: "swift-huggingface"),
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

@@ -1,21 +1,21 @@
-// IndexTTS2Generator.swift — the production generation driver (generate_v2.py port), tying the
-// parity-locked components into one reusable pipeline: tokenize → reference conditioning →
-// GPT AR → S2Mel CFM → BigVGAN → 22.05 kHz waveform.
+// IndexTTS2Generator.swift — the production generation driver (IndexTTS-2.5 `infer_v2_5.py`
+// port), tying the parity-locked components into one reusable pipeline:
+// text frontend → reference conditioning → GPT AR → EnhancedCodec decode → length regulator
+// → S2Mel CFM → BigVGAN → 22.05 kHz waveform.
 //
 // Engine-free by design (no MLXToolKit import): the MLXIndexTTS2TTS wrapper owns the engine
 // contract, PCM decode/resample, and metaData routing; this class owns the kernels.
 //
-// Dtype policy: components load AS-SHIPPED (fp16 main checkpoint, fp32 w2v-BERT/codec/campplus)
-// — exactly the dtype the Python reference ran on Metal to produce the Stage-0 goldens. The
-// parity gates (P2–P7) ran fp32-upcast lanes; production quality is quantified in the app
-// harness (dBFS + |STFT| + listen). Watchdog rules: weight loads on the CPU stream with
-// `eval(model)` materialized post-update; every forward runs on the caller's (GPU) stream;
-// int8/int4 quantize on CPU at load, forwards GPU-only (quant matmul is Metal-only).
+// Dtype policy: components load AS-SHIPPED (fp16 main checkpoint incl. the codec, fp32
+// w2v-BERT / CAMPPlus) — the dtype the Python reference runs on Metal. Parity gates run fp32
+// CPU lanes. Watchdog rules: weight loads on the CPU stream with `eval(model)` materialized
+// post-update; every forward runs on the caller's (GPU) stream; int8/int4 quantize on CPU at
+// load, forwards GPU-only (quant matmul is Metal-only).
 //
-// Duration control (E12): the length-regulator target length is the native lever —
-// default ylens = code_len · 1.72 (generate_v2); `speechRate` divides it; `targetDuration`
-// pins the total mel-frame budget (22 050 / 256 ≈ 86.13 frames/s), distributed across
-// segments proportional to their code length.
+// Duration control (E12): the length-regulator target is the native lever — reference
+// `int(len(S_infer) · 1.72 · duration_factor)`; `speechRate` is 1/duration_factor;
+// `targetDuration` pins the total mel-frame budget (22 050 / 256 ≈ 86.13 frames/s),
+// distributed across segments proportional to their content length.
 
 import Foundation
 import MLX
@@ -40,63 +40,68 @@ public enum IndexTTS2Error: Error, CustomStringConvertible {
     }
 }
 
-/// The assembled IndexTTS2 pipeline. Construct with `load(...)` (heavy — pages all weights),
-/// then `prepareReference` once per voice and `synthesize` per utterance.
+/// The assembled IndexTTS-2.5 pipeline. Construct with `load(...)` (heavy — pages all
+/// weights), then `prepareReference` once per voice and `synthesize` per utterance.
 public final class IndexTTS2Generator {
 
     public static let outputSampleRate = 22_050
-    /// Front-end conditioning rate (w2v-BERT / CampPlus).
+    /// Front-end conditioning rate (w2v-BERT / CAMPPlus).
     public static let conditioningSampleRate = 16_000
     /// Mel frames per second at the S2Mel hop (22050 / 256).
     static let melFramesPerSecond = 22_050.0 / 256.0
-    /// generate_v2's default length-regulator expansion factor.
+    /// The reference's length-regulator expansion factor (codec 50 Hz → mel 86.13 Hz).
     static let defaultLengthFactor = 1.72
+    /// The checkpoint's tiktoken vocabulary file name.
+    public static let tokenizerFile = "multilingual_zh_ja_yue_char_del.tiktoken"
 
-    let gpt: UnifiedVoiceV2
-    let s2mel: S2Mel
-    let bigvgan: BigVGANV2
-    let vq2emb: Vq2Emb
-    let w2v: Wav2Vec2BertModel
-    let repcodec: RepCodec
-    let campplus: CAMPPlus
-    public let tokenizer: IndexTTSTextTokenizer
-    let semanticMean: MLXArray
-    let semanticStd: MLXArray
+    // Components are public for the parity-gate lane (`indextts2-gate`, a separate target).
+    public let gpt: UnifiedVoiceV25
+    public let s2mel: S2Mel
+    public let bigvgan: BigVGANV2
+    public let codec: EnhancedCodecDecoder
+    public let w2v: Wav2Vec2BertModel
+    public let campplus: CAMPPlus
+    public let frontend: IndexTTSTextFrontend
+    public let semanticMean: MLXArray
+    public let semanticStd: MLXArray
 
     /// GPT-backbone quant applied at load (nil = as-shipped fp16).
     public let quantBits: Int?
 
-    /// Test-facing seam for the engine's **INF gate** (C14): every loaded component, keyed by role.
-    /// Public because the engine wrapper lives in a separate module (MLXIndexTTS2TTS) and the
-    /// components are internal here. `campplus` is the BatchNorm carrier; the rest are in scope so
-    /// a future training-mode-sensitive layer cannot slip in unwatched.
+    /// Test-facing seam for the engine's **INF gate** (C14): every loaded component, keyed by
+    /// role. `campplus` is the BatchNorm carrier; the rest are in scope so a future
+    /// training-mode-sensitive layer cannot slip in unwatched.
     public var inferenceModeGraphs: [String: MLXNN.Module?] {
-        ["gpt": gpt, "s2mel": s2mel, "bigvgan": bigvgan, "vq2emb": vq2emb,
-         "w2v": w2v, "repcodec": repcodec, "campplus": campplus]
+        ["gpt": gpt, "s2mel": s2mel, "bigvgan": bigvgan, "codec": codec, "w2v": w2v, "campplus": campplus]
     }
 
     // MARK: - Loading
 
-    private init(gpt: UnifiedVoiceV2, s2mel: S2Mel, bigvgan: BigVGANV2, vq2emb: Vq2Emb,
-                 w2v: Wav2Vec2BertModel, repcodec: RepCodec, campplus: CAMPPlus,
-                 tokenizer: IndexTTSTextTokenizer, semanticMean: MLXArray,
-                 semanticStd: MLXArray, quantBits: Int?) {
+    private init(gpt: UnifiedVoiceV25, s2mel: S2Mel, bigvgan: BigVGANV2, codec: EnhancedCodecDecoder,
+                 w2v: Wav2Vec2BertModel, campplus: CAMPPlus, frontend: IndexTTSTextFrontend,
+                 semanticMean: MLXArray, semanticStd: MLXArray, quantBits: Int?) {
         self.gpt = gpt
         self.s2mel = s2mel
         self.bigvgan = bigvgan
-        self.vq2emb = vq2emb
+        self.codec = codec
         self.w2v = w2v
-        self.repcodec = repcodec
         self.campplus = campplus
-        self.tokenizer = tokenizer
+        self.frontend = frontend
         self.semanticMean = semanticMean
         self.semanticStd = semanticStd
         self.quantBits = quantBits
     }
 
+    /// Parity-gate lane: upcast every component to `dtype` (fp32 CPU goldens) in place.
+    public func upcast(to dtype: DType) {
+        for module in [gpt, s2mel, bigvgan, codec, w2v, campplus] as [Module] {
+            module.update(parameters: module.parameters().mapValues { $0.asType(dtype) })
+            eval(module)
+        }
+    }
+
     static func bakedNPY(_ name: String) throws -> MLXArray {
-        guard let url = Bundle.module.url(forResource: name, withExtension: "npy",
-                                          subdirectory: "Resources") else {
+        guard let url = Bundle.module.url(forResource: name, withExtension: "npy", subdirectory: "Resources") else {
             throw IndexTTS2Error.missingResource("\(name).npy")
         }
         return try NPY.load(url)
@@ -105,7 +110,7 @@ public final class IndexTTS2Generator {
     /// Load one component with the full weight-key contract (0-missing / 0-unused).
     ///
     /// Internal rather than private so the C14 INF gate can exercise this choke point directly —
-    /// it is where inference mode is set for all seven components.
+    /// it is where inference mode is set for all six components.
     static func loadComponent<M: Module>(
         _ model: M, url: URL, sanitize: ([String: MLXArray]) -> [String: MLXArray]
     ) throws -> M {
@@ -118,23 +123,17 @@ public final class IndexTTS2Generator {
         let unused = Set(sanitized.keys).subtracting(declared)
         guard missing.isEmpty, unused.isEmpty else {
             throw IndexTTS2Error.weightContract(
-                "\(url.lastPathComponent): missing \(missing.count) "
-                + "(\(missing.sorted().prefix(4))) unused \(unused.count) "
-                + "(\(unused.sorted().prefix(4)))")
+                "\(url.lastPathComponent): missing \(missing.count) (\(missing.sorted().prefix(4))) "
+                + "unused \(unused.count) (\(unused.sorted().prefix(4)))")
         }
         try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: .all)
 
-        // INFERENCE MODE — load-bearing, not hygiene (engine C14 / the INF gate).
-        // `MLXNN.Module.training` defaults to `true`, and in that state `BatchNorm` normalizes by
-        // the CURRENT batch's statistics and *overwrites* the checkpoint's
-        // `running_mean`/`running_var` on every forward (MLXNN/Normalization.swift:
-        // `if self.training, let runningMean, let runningVar`). CAMPPlus — the speaker encoder
-        // whose embedding conditions the whole clone — is dense with BatchNorms (`batchnorm`,
-        // `bn`, `bn1`, `bn2` across TDNN/CAMDense/FSMN blocks), so without this the speaker
-        // embedding is computed from the reference clip's own statistics and drifts run to run.
-        // All seven components load through here, so this is the one choke point — call sites
-        // deliberately do NOT repeat it. (The `indextts2-gate` parity harness loads inline, on its
-        // own path, and sets it there.)
+        // INFERENCE MODE — load-bearing, not hygiene (engine C14 / the INF gate). `MLXNN.Module`
+        // defaults to training mode, where `BatchNorm` normalizes by the CURRENT batch and
+        // overwrites the checkpoint's running stats on every forward. CAMPPlus — the speaker
+        // encoder whose embedding conditions the whole clone — is dense with BatchNorms, so
+        // without this the speaker embedding drifts run to run. Every component loads through
+        // here, so this is the one choke point — call sites deliberately do NOT repeat it.
         model.train(false)
         eval(model)
         return model
@@ -142,32 +141,30 @@ public final class IndexTTS2Generator {
 
     /// Page in the full pipeline. Weight loads run on the CPU stream (watchdog rule);
     /// `quantBits` (8|4) quantizes the `gpt.h.*` Linears in place (donor scope, group 64).
-    /// `progress` receives a coarse [0, 1] fraction across the 7 components.
+    /// `progress` receives a coarse [0, 1] fraction across the 6 components.
     public static func load(
-        modelDirectory: URL, w2vBertDirectory: URL, semanticCodecDirectory: URL,
+        modelDirectory: URL, w2vBertDirectory: URL,
         quantBits: Int? = nil, progress: ((Double) -> Void)? = nil
     ) throws -> IndexTTS2Generator {
-        guard let vocabURL = Bundle.module.url(forResource: "tokenizer_vocab",
-                                               withExtension: "json",
-                                               subdirectory: "Resources") else {
-            throw IndexTTS2Error.missingResource("tokenizer_vocab.json")
+        let vocabURL = modelDirectory.appending(path: tokenizerFile)
+        guard FileManager.default.fileExists(atPath: vocabURL.path) else {
+            throw IndexTTS2Error.missingWeights(vocabURL.path)
         }
-        let tokenizer = try IndexTTSTextTokenizer(vocabURL: vocabURL)
+        let frontend = IndexTTSTextFrontend(tokenizer: try TiktokenBPE(vocabularyURL: vocabURL))
         let semanticMean = try bakedNPY("semantic_mean").asType(.float32)
         let semanticStd = try bakedNPY("semantic_std").asType(.float32)
-        guard let campplusURL = Bundle.module.url(forResource: "campplus_cn_common",
-                                                  withExtension: "safetensors",
+        guard let campplusURL = Bundle.module.url(forResource: "campplus_cn_common", withExtension: "safetensors",
                                                   subdirectory: "Resources") else {
             throw IndexTTS2Error.missingResource("campplus_cn_common.safetensors")
         }
 
         return try Device.withDefaultDevice(Device(.cpu)) { () -> IndexTTS2Generator in
             var step = 0.0
-            func tick() { step += 1; progress?(step / 7.0) }
+            func tick() { step += 1; progress?(step / 6.0) }
 
             let gpt = try loadComponent(
-                UnifiedVoiceV2(), url: modelDirectory.appending(path: "gpt.safetensors"),
-                sanitize: UnifiedVoiceV2.sanitize)
+                UnifiedVoiceV25(), url: modelDirectory.appending(path: "gpt.safetensors"),
+                sanitize: UnifiedVoiceV25.sanitize)
             if let bits = quantBits {
                 // Donor scope: ONLY the GPT2 backbone Linears; embeddings / heads / norms /
                 // conditioners stay full precision. Quantize on CPU; forwards must be GPU.
@@ -178,50 +175,36 @@ public final class IndexTTS2Generator {
             }
             tick()
             let s2mel = try loadComponent(
-                S2Mel(), url: modelDirectory.appending(path: "s2mel.safetensors"),
-                sanitize: S2Mel.sanitize)
+                S2Mel(), url: modelDirectory.appending(path: "s2mel.safetensors"), sanitize: S2Mel.sanitize)
             tick()
             let bigvgan = try loadComponent(
-                BigVGANV2(), url: modelDirectory.appending(path: "bigvgan.safetensors"),
-                sanitize: { $0 })
+                BigVGANV2(), url: modelDirectory.appending(path: "bigvgan.safetensors"), sanitize: { $0 })
             tick()
-            let vq2emb = try loadComponent(
-                Vq2Emb(), url: modelDirectory.appending(path: "vq2emb.safetensors"),
-                sanitize: Vq2Emb.sanitize)
+            let codec = try loadComponent(
+                EnhancedCodecDecoder(), url: modelDirectory.appending(path: "codec.safetensors"),
+                sanitize: EnhancedCodecDecoder.sanitize)
             tick()
             let w2v = try loadComponent(
-                Wav2Vec2BertModel(),
-                url: w2vBertDirectory.appending(path: "model.safetensors"),
+                Wav2Vec2BertModel(), url: w2vBertDirectory.appending(path: "model.safetensors"),
                 sanitize: Wav2Vec2BertModel.sanitize)
             tick()
-            let repcodec = try loadComponent(
-                RepCodec(),
-                url: semanticCodecDirectory.appending(path: "semantic_codec/model.safetensors"),
-                sanitize: RepCodec.sanitize)
-            tick()
-            // loadComponent leaves every component in inference mode (CAMPPlus's BatchNorms must
-            // read running stats) — it is the choke point, so no train(false) here.
-            let campplus = try loadComponent(
-                CAMPPlus(), url: campplusURL, sanitize: CAMPPlus.sanitize)
+            let campplus = try loadComponent(CAMPPlus(), url: campplusURL, sanitize: CAMPPlus.sanitize)
             tick()
 
             return IndexTTS2Generator(
-                gpt: gpt, s2mel: s2mel, bigvgan: bigvgan, vq2emb: vq2emb, w2v: w2v,
-                repcodec: repcodec, campplus: campplus, tokenizer: tokenizer,
-                semanticMean: semanticMean, semanticStd: semanticStd, quantBits: quantBits)
+                gpt: gpt, s2mel: s2mel, bigvgan: bigvgan, codec: codec, w2v: w2v, campplus: campplus,
+                frontend: frontend, semanticMean: semanticMean, semanticStd: semanticStd, quantBits: quantBits)
         }
     }
 
     // MARK: - Reference conditioning
 
-    /// Everything `synthesize` needs from one reference voice — prepare once, reuse per line
-    /// (the dub/long-form pattern).
+    /// Everything `synthesize` needs from one reference voice — prepare once, reuse per line.
     public struct Reference {
-        public let speechCond: MLXArray        // (1, 32, 1280) perceiver speaker conditioning
+        public let style: MLXArray             // (1, 192) CAMPPlus embedding → spk_emb_proj + CFM style
         public let baseEmovec: MLXArray        // (1, 1280) reference-audio emotion vector
-        public let style: MLXArray             // (1, 192) CampPlus embedding
-        public let promptCondition: MLXArray   // (1, T_ref, 512) length-regulated S_ref
-        public let refMel: MLXArray            // (1, 80, T_ref) CFM prompt
+        public let promptCondition: MLXArray   // (1, T_ref_mel, 512) length-regulated w2v-BERT features
+        public let refMel: MLXArray            // (1, 80, T_ref_mel) CFM prompt
     }
 
     /// Build the reference conditioning from mono PCM at the two pipeline rates
@@ -234,35 +217,27 @@ public final class IndexTTS2Generator {
             throw IndexTTS2Error.audioTooShort
         }
         let (_, hs) = w2v(inputFeatures: features, attentionMask: mask)
-        let spkCondEmb = Wav2Vec2BertModel.semanticTap(hs, mean: semanticMean, std: semanticStd)
+        let spkCondEmb = Wav2Vec2BertModel.semanticTap(hs, mean: semanticMean, std: semanticStd)  // (1, T, 1024)
         eval(spkCondEmb)
 
-        let (_, sRef) = repcodec.quantize(spkCondEmb)
-        eval(sRef)
-
-        guard let cmn = CampPlusFbank.fbankCMN(wav16k) else {
-            throw IndexTTS2Error.audioTooShort
-        }
-        let style = campplus(cmn[.newAxis, 0..., 0...])
+        guard let cmn = CampPlusFbank.fbankCMN(wav16k) else { throw IndexTTS2Error.audioTooShort }
+        let style = campplus(cmn.expandedDimensions(axis: 0))
         eval(style)
 
         let refMel = RefMel.melSpectrogram(wav22k)
-        let promptCondition = s2mel.lengthRegulatorModule(
-            sRef, ylens: MLXArray([Int32(refMel.dim(2))]))
+        // 2.5 conditions the CFM prompt on the RAW semantic features (no codec round trip).
+        let promptCondition = s2mel.lengthRegulatorModule(spkCondEmb, ylens: MLXArray([Int32(refMel.dim(2))]))
         eval(refMel, promptCondition)
 
-        let spkNCL = spkCondEmb.transposed(0, 2, 1)
-        let speechCond = gpt.getConditioning(spkNCL)
-        let baseEmovec = gpt.getEmovec(spkNCL)
-        eval(speechCond, baseEmovec)
+        let baseEmovec = gpt.getEmovec(spkCondEmb.transposed(0, 2, 1))
+        eval(baseEmovec)
 
-        return Reference(speechCond: speechCond, baseEmovec: baseEmovec, style: style,
-                         promptCondition: promptCondition, refMel: refMel)
+        return Reference(style: style, baseEmovec: baseEmovec, promptCondition: promptCondition, refMel: refMel)
     }
 
     // MARK: - Synthesis
 
-    /// generate_v2 defaults.
+    /// Reference defaults (`infer_v2_5.py`).
     public struct SynthesisParams {
         public var maxMelTokens = 1500
         public var maxTextTokensPerSegment = 120
@@ -276,7 +251,8 @@ public final class IndexTTS2Generator {
         public init() {}
     }
 
-    /// Synthesize one utterance. `emotionWeights` are the 8 category weights in
+    /// Synthesize one utterance. `language` nil = script detection (Latin → English; pass
+    /// `.es` explicitly for Spanish). `emotionWeights` are the 8 category weights in
     /// `EmotionPresets.categories` order, ALREADY emo_alpha-scaled (nil = reference emotion
     /// as-is). `speechRate` scales pace (1.0 natural, >1 faster); `targetDurationSeconds`
     /// pins the total output length via the native length-regulator lever (wins over rate).
@@ -284,86 +260,64 @@ public final class IndexTTS2Generator {
     public func synthesize(
         text: String,
         reference: Reference,
+        language: IndexTTSLanguage? = nil,
         emotionWeights: [Float]? = nil,
         targetDurationSeconds: Double? = nil,
         speechRate: Double? = nil,
         params: SynthesisParams = SynthesisParams(),
         cancelCheck: (() throws -> Void)? = nil
     ) throws -> [Float] {
-        // Emotion blend (generate_v2): preset weights ⇒ emovec_mat + (1−Σw)·base; else base.
+        // Emotion blend: preset weights ⇒ emovec_mat + (1−Σw)·base; else base.
         let emoVec: MLXArray
         if let weights = emotionWeights {
-            emoVec = EmotionPresets.blend(weights: weights, style: reference.style,
-                                          baseEmovec: reference.baseEmovec)
+            emoVec = EmotionPresets.blend(weights: weights, style: reference.style, baseEmovec: reference.baseEmovec)
         } else {
             emoVec = reference.baseEmovec
         }
-        let conditioning = gpt.prepareConditioningLatents(
-            speechConditioning: reference.speechCond, emoVec: emoVec, batchSize: 1)
+        let conditioning = gpt.prepareConditioningLatents(style: reference.style, emoVec: emoVec)
         eval(conditioning)
 
-        // Tokenize + split long text. splitSegments partitions the piece sequence
-        // order-preserving, so the paired ids are recovered by walking a cursor.
-        let pairs = tokenizer.encodeWithPieces(text)
-        let segments = tokenizer.splitSegments(
-            pairs.map(\.surface), maxTokensPerSegment: params.maxTextTokensPerSegment)
-        var cursor = 0
-        let segmentIds: [[Int]] = segments.map { segment in
-            let ids = pairs[cursor ..< cursor + segment.count].map(\.id)
-            cursor += segment.count
-            return ids
-        }
-        precondition(cursor == pairs.count, "splitSegments dropped tokens")
+        let prepared = try frontend.prepare(text, language: language, maxTokensPerSegment: params.maxTextTokensPerSegment)
+        let languageID = prepared.language.languageID
 
-        // Per-segment AR → codes (needed up front for the targetDuration frame budget).
-        var generated: [(ids: [Int], codes: [Int])] = []
-        for ids in segmentIds where !ids.isEmpty {
+        // Per-segment AR → codes → codec features (needed up front for the targetDuration budget).
+        var generated: [MLXArray] = []
+        for ids in prepared.tokenIDs where !ids.isEmpty {
             try cancelCheck?()
-            let textTokens = MLXArray(ids.map(Int32.init)).reshaped(1, ids.count)
             let result = gpt.generateMelCodes(
-                conditioning: conditioning, textTokens: textTokens,
+                conditioning: conditioning, textTokens: ids, languageID: languageID,
                 maxMelTokens: params.maxMelTokens, temperature: params.temperature,
-                topK: params.topK, topP: params.topP,
-                repetitionPenalty: params.repetitionPenalty)
+                topK: params.topK, topP: params.topP, repetitionPenalty: params.repetitionPenalty)
             let codes = compressSilence(result.melCodes)
-            if !codes.isEmpty { generated.append((ids: ids, codes: codes)) }
+            guard !codes.isEmpty else { continue }
+            let sInfer = codec(MLXArray(codes.map(Int32.init)).expandedDimensions(axis: 0))   // (1, 2T, 1024)
+            eval(sInfer)
+            generated.append(sInfer)
         }
         // Cancellation must win over emptyGeneration: a per-token bail inside generateMelCodes
-        // (CAN gate) can leave `generated` empty/partial — surface the CancellationError
-        // unchanged here rather than laundering it into IndexTTS2Error.emptyGeneration.
+        // (CAN gate) can leave `generated` empty/partial — surface the CancellationError.
         try cancelCheck?()
         guard !generated.isEmpty else { throw IndexTTS2Error.emptyGeneration }
 
         // Length-regulator targets (the E12 duration lever).
-        let totalCodes = generated.reduce(0) { $0 + $1.codes.count }
+        let totalContent = generated.reduce(0) { $0 + $1.dim(1) }
         let silenceSamples = generated.count > 1 && params.intervalSilenceMs > 0
-            ? Int(Double(Self.outputSampleRate) * Double(params.intervalSilenceMs) / 1000.0)
-            : 0
-        func targetFrames(for codeLen: Int) -> Int {
+            ? Int(Double(Self.outputSampleRate) * Double(params.intervalSilenceMs) / 1000.0) : 0
+        func targetFrames(for contentLen: Int) -> Int {
             if let duration = targetDurationSeconds {
-                // Total speech frames = duration − inserted silence, split ∝ code length.
-                let silenceSeconds = Double(silenceSamples * (generated.count - 1))
-                    / Double(Self.outputSampleRate)
+                let silenceSeconds = Double(silenceSamples * (generated.count - 1)) / Double(Self.outputSampleRate)
                 let speechFrames = max(1.0, (duration - silenceSeconds) * Self.melFramesPerSecond)
-                return max(4, Int(speechFrames * Double(codeLen) / Double(totalCodes)))
+                return max(4, Int(speechFrames * Double(contentLen) / Double(totalContent)))
             }
             let rate = speechRate.map { max(0.25, min(4.0, $0)) } ?? 1.0
-            return max(4, Int(Double(codeLen) * Self.defaultLengthFactor / rate))
+            return max(4, Int(Double(contentLen) * Self.defaultLengthFactor / rate))
         }
 
         // Per-segment S2Mel + vocoder.
         var audioSegments: [[Float]] = []
-        for (ids, codes) in generated {
+        for sInfer in generated {
             try cancelCheck?()
-            let textTokens = MLXArray(ids.map(Int32.init)).reshaped(1, ids.count)
-            let melCodes = MLXArray(codes.map(Int32.init)).reshaped(1, codes.count)
-
-            let latent = gpt.forwardLatent(
-                conditioning: conditioning, textTokens: textTokens, melCodes: melCodes)
-            let gptlayerOut = s2mel.gptLayerModule(latent)
-            let sInfer = vq2emb(melCodes).transposed(0, 2, 1) + gptlayerOut
-            let cond = s2mel.lengthRegulatorModule(
-                sInfer, ylens: MLXArray([Int32(targetFrames(for: codes.count))]))
+            let cond = s2mel.lengthRegulatorModule(sInfer, ylens: MLXArray([Int32(targetFrames(for: sInfer.dim(1)))]))
             let catCondition = concatenated([reference.promptCondition, cond], axis: 1)
             eval(catCondition)
 
@@ -371,8 +325,7 @@ public final class IndexTTS2Generator {
             let mel = s2mel.cfmModule.inference(
                 mu: catCondition, xLens: MLXArray([Int32(catCondition.dim(1))]),
                 prompt: reference.refMel, style: reference.style,
-                nTimesteps: params.diffusionSteps, temperature: 1.0,
-                inferenceCfgRate: params.cfgRate)
+                nTimesteps: params.diffusionSteps, temperature: 1.0, inferenceCfgRate: params.cfgRate)
             eval(mel)
 
             try cancelCheck?()
@@ -388,7 +341,6 @@ public final class IndexTTS2Generator {
             Memory.clearCache()
         }
 
-        // Concatenate with interval silence (generate_v2's default multi-segment path).
         if audioSegments.count == 1 { return audioSegments[0] }
         var out: [Float] = []
         for (index, segment) in audioSegments.enumerated() {

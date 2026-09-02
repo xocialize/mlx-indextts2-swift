@@ -5,14 +5,14 @@
 // CAMDense / FSMN blocks). `MLXNN.Module.training` defaults to `true`, and in that state BatchNorm
 // normalizes by the CURRENT batch's statistics and OVERWRITES the checkpoint's
 // running_mean/running_var on every forward — so the speaker embedding would be computed from the
-// reference clip's own statistics and would drift run to run. The other six components are
+// reference clip's own statistics and would drift run to run. The other five components are
 // LayerNorm/RMSNorm/GroupNorm and structurally unaffected.
 //
 // POSTURE OF RECORD: `.moduleGraph`.
 //
 // CHOKE POINT: `IndexTTS2Generator.loadComponent(_:url:sanitize:)` (2026-07-25). Inference mode
 // used to be set only next to the CAMPPlus construction site — fix-by-repetition across four
-// places. All seven components load through the one function, so that is where it belongs.
+// places. All six components load through the one function, so that is where it belongs.
 //
 // No download needed: these round-trip a component's OWN parameters through a temp safetensors
 // (with an identity `sanitize`, since the keys are already module-shaped), which exercises the real
@@ -69,7 +69,7 @@ final class InferenceModeTests: XCTestCase {
     /// The choke point is generic over `Module`, so it must put EVERY component in inference mode,
     /// not just the one that happens to carry BatchNorms today.
     func testChokePointAppliesToAnyComponent() throws {
-        let model = Vq2Emb()
+        let model = EnhancedCodecDecoder()
         let url = try writeSyntheticCheckpoint(for: model)
         defer { try? FileManager.default.removeItem(at: url) }
         let loaded = try IndexTTS2Generator.loadComponent(model, url: url, sanitize: { $0 })
