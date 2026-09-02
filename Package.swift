@@ -49,8 +49,11 @@ let package = Package(
             name: "indextts2-gate",
             dependencies: [
                 "MLXIndexTTS2",
+                "MLXIndexTTS2TTS",
                 .product(name: "MLXRandom", package: "mlx-swift"),
                 .product(name: "MLXAudioDSP", package: "mlx-audio-dsp"),
+                // `engine` mode: the consumer path (MLXServeEngine register → prepare → run).
+                .product(name: "MLXServeCore", package: "mlx-engine-swift"),
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

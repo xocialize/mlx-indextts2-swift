@@ -16,6 +16,9 @@ import MLX
 import MLXNN
 import MLXRandom
 import MLXIndexTTS2
+import MLXIndexTTS2TTS
+import MLXServeCore
+import MLXToolKit
 
 // MARK: - Plumbing
 
@@ -361,6 +364,56 @@ func gateFootprint() throws {
     print("FOOTPRINT DONE")
 }
 
+// MARK: - engine: the consumer path — MLXServeEngine (DEFAULT policy) register → prepare
+// (engine-executed materialization from the mlx-community repo into `--store`) → run → evict.
+// This is the exact call sequence ML[X] Audio Studio's VoiceLane makes.
+
+func gateEngine() async throws {
+    let store = URL(fileURLWithPath: argValue("--store")
+        ?? "/Volumes/Satechi/Development/mlxengine-audio/WIP/indextts25/store")
+    let refURL = URL(fileURLWithPath: argValue("--ref")
+        ?? "/Volumes/Satechi/Development/mlxengine-audio/Archive/MLXEngineAudio/MLXEngineAudio/TTSValidation/indextts2-ref.wav")
+    let clip = try Data(contentsOf: refURL)
+    let engine = MLXServeEngine()   // .permissiveOnly — the weights must admit here, no acknowledgement
+    await engine.useModelStore(ModelStore(root: store))
+    let t0 = Date()
+    let id = try await engine.register(IndexTTS2Package.registration, configuration: IndexTTS2Configuration(),
+                                       id: PackageID("indextts2"))
+    let advisories = await engine.licenseAdvisories
+    print("  registered \(id.rawValue) under .permissiveOnly; license advisories: \(advisories.count)")
+    guard advisories.isEmpty else { fail("license advisory raised — the weights are not admitted cleanly: \(advisories)") }
+    let needs = await engine.needsDownload(.tts, package: id)
+    print("  needsDownload=\(needs) (store \(store.path))")
+    try await engine.prepare(.tts, package: id)
+    print(String(format: "  prepared in %.1fs (download + load)", Date().timeIntervalSince(t0)))
+
+    func take(_ text: String, meta: MetaData, label: String) async throws {
+        let t = Date()
+        let request = TTSRequest(text: text, voice: VoiceSelector(.referenceAudio(Audio(format: .wav, data: clip))),
+                                 metaData: meta)
+        let response = try await engine.run(request, package: id)
+        guard let tts = response as? TTSResponse else { fail("unexpected response") }
+        let wav = tts.audio.data
+        // 16-bit PCM body after the 44-byte header.
+        let samples = wav.dropFirst(44).withUnsafeBytes { raw -> [Float] in
+            raw.bindMemory(to: Int16.self).map { Float($0) / 32768 }
+        }
+        let secs = Double(samples.count) / Double(tts.audio.sampleRate ?? 22_050)
+        print(String(format: "  [RUN] %@: %.2fs audio, %.1f dBFS, %.2fs wall (rtf %.2f)", label, secs, dbfs(samples),
+                     Date().timeIntervalSince(t), Date().timeIntervalSince(t) / max(secs, 0.01)))
+        guard dbfs(samples) > -35, dbfs(samples) < -10, secs > 1 else { fail("\(label): audio outside the validity envelope") }
+        try wav.write(to: cwd.appending(path: "PORTING/v25_engine_\(label).wav"))
+    }
+    try await take("The afternoon light settles quietly on the river, and nobody is in a hurry.",
+                   meta: ["seed": .int(42)], label: "en")
+    try await take("The afternoon light settles quietly on the river, and nobody is in a hurry.",
+                   meta: ["seed": .int(42), "emotion": .string("happy"), "emoAlpha": .double(0.6), "targetDuration": .double(4.0)],
+                   label: "happy_4s")
+    try await take("今天的天气真不错，我们一起去公园散步吧。", meta: ["seed": .int(42), "language": .string("zh")], label: "zh")
+    await engine.evict(package: id)
+    print("ENGINE GATE PASSED")
+}
+
 // MARK: - Entry
 
 let mode = CommandLine.arguments.dropFirst().first ?? "all"
@@ -374,9 +427,10 @@ do {
     case "e2e": try gateE2E()
     case "quant": try gateQuant()
     case "footprint": try gateFootprint()
+    case "engine": try await gateEngine()   // top-level await: no main-thread wait to deadlock actors
     case "all":
         try gateTok(); try gateRef(); try gateGPT(); try gateCodec(); try gateS2Mel()
-    default: fail("unknown mode \(mode) (tok | ref | gpt | codec | s2mel | e2e | quant | footprint | all)")
+    default: fail("unknown mode \(mode) (tok | ref | gpt | codec | s2mel | e2e | quant | footprint | engine | all)")
     }
 } catch {
     fail("\(error)")
