@@ -387,10 +387,12 @@ func gateEngine() async throws {
     try await engine.prepare(.tts, package: id)
     print(String(format: "  prepared in %.1fs (download + load)", Date().timeIntervalSince(t0)))
 
-    func take(_ text: String, meta: MetaData, label: String) async throws {
+    @discardableResult
+    func take(_ text: String, meta: MetaData, label: String,
+              emotion: TTSEmotion? = nil, targetDuration: Double? = nil) async throws -> Data {
         let t = Date()
         let request = TTSRequest(text: text, voice: VoiceSelector(.referenceAudio(Audio(format: .wav, data: clip))),
-                                 metaData: meta)
+                                 emotion: emotion, targetDuration: targetDuration, metaData: meta)
         let response = try await engine.run(request, package: id)
         guard let tts = response as? TTSResponse else { fail("unexpected response") }
         let wav = tts.audio.data
@@ -403,12 +405,33 @@ func gateEngine() async throws {
                      Date().timeIntervalSince(t), Date().timeIntervalSince(t) / max(secs, 0.01)))
         guard dbfs(samples) > -35, dbfs(samples) < -10, secs > 1 else { fail("\(label): audio outside the validity envelope") }
         try wav.write(to: cwd.appending(path: "PORTING/v25_engine_\(label).wav"))
+        return wav
     }
     try await take("The afternoon light settles quietly on the river, and nobody is in a hurry.",
                    meta: ["seed": .int(42)], label: "en")
-    try await take("The afternoon light settles quietly on the river, and nobody is in a hurry.",
+    let en = "The afternoon light settles quietly on the river, and nobody is in a hurry."
+    let viaMeta = try await take(en,
                    meta: ["seed": .int(42), "emotion": .string("happy"), "emoAlpha": .double(0.6), "targetDuration": .double(4.0)],
                    label: "happy_4s")
+    // E12 typed plane (contract 1.38.0, adopted v0.5.0): the SAME seed through the typed fields
+    // must land on the SAME mechanism — byte-identical output is the receipt, not "sounds alike".
+    let viaTyped = try await take(en, meta: ["seed": .int(42), "emoAlpha": .double(0.6)], label: "happy_4s_typed",
+                                  emotion: .categorical("happy"), targetDuration: 4.0)
+    guard viaTyped == viaMeta else {
+        fail("E12: typed emotion/targetDuration diverged from the metaData path (\(viaTyped.count) vs \(viaMeta.count) bytes)")
+    }
+    print("  [E12] typed .categorical(\"happy\") + targetDuration 4.0 == metaData path: byte-identical")
+    // Declaration-gated: a mode this surface does not declare is refused by the ENGINE, pre-admission.
+    do {
+        _ = try await engine.run(TTSRequest(text: en, voice: VoiceSelector(.referenceAudio(Audio(format: .wav, data: clip))),
+                                            emotion: .textDescription("sound exhausted")), package: id)
+        fail("E12: the engine admitted .textDescription on a surface declaring only categorical/vector")
+    } catch let error as PackageError {
+        guard case .unsupportedRequestFeature(let detail) = error, detail.contains("textDescription") else {
+            fail("E12: wrong refusal for an undeclared emotion mode: \(error)")
+        }
+        print("  [E12] undeclared .textDescription refused before admission: \(detail)")
+    }
     try await take("今天的天气真不错，我们一起去公园散步吧。", meta: ["seed": .int(42), "language": .string("zh")], label: "zh")
     await engine.evict(package: id)
     print("ENGINE GATE PASSED")

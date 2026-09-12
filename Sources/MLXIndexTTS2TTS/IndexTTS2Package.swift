@@ -81,8 +81,17 @@ public final class IndexTTS2Package: ModelPackage {
                         + "via metaData.language) with native per-request emotion control (8-category "
                         + "preset plane, decoupled from the cloned speaker) and native duration control "
                         + "(targetDuration / speechRate) — the fit-to-cue lever for dubbing. "
-                        + "Requires voice.referenceAudio (no preset voices).",
-                    modes: [.expressive, .neutral]
+                        + "Requires voice.referenceAudio (no preset voices). E12 typed plane: "
+                        + "`emotion` (.categorical over the shared 8-name vocabulary, or an 8-number "
+                        + ".vector) and `targetDuration`; metaData strings remain the compat path, and "
+                        + "`emoAlpha` / `speechRate` stay on metaData.",
+                    modes: [.expressive, .neutral],
+                    // E12 declaration (contract 1.38.0, AB-A-0049 part 3). Only what the PORT
+                    // implements: the preset/vector head. `.referenceAudio` (upstream
+                    // emo_audio_prompt) and `.textDescription` (upstream use_emo_text) are not
+                    // ported, so they are not declared and the engine refuses them pre-admission.
+                    controls: TTSControls(emotionModes: [.categorical, .vector],
+                                          supportsTargetDuration: true)
                 )
             ]
         )
@@ -196,9 +205,13 @@ public final class IndexTTS2Package: ModelPackage {
             }
             language = parsed
         }
-        let emotionWeights = try Self.parseEmotion(
-            tts.metaData["emotion"], alpha: tts.metaData.doubleValue("emoAlpha") ?? 0.6)
-        let targetDuration = tts.metaData.doubleValue("targetDuration")
+        // E12 typed plane (contract 1.38.0): `tts.emotion` / `tts.targetDuration` win; the
+        // metaData strings are the compatibility path. `emoAlpha` (intensity pre-scale) and
+        // `speechRate` are not in the typed plane and stay on metaData.
+        let emotionWeights = try Self.resolveEmotionWeights(
+            typed: tts.emotion, meta: tts.metaData["emotion"],
+            alpha: tts.metaData.doubleValue("emoAlpha") ?? 0.6)
+        let targetDuration = tts.targetDuration ?? tts.metaData.doubleValue("targetDuration")
         let speechRate = tts.metaData.doubleValue("speechRate")
 
         if let seed = tts.metaData.intValue("seed") {
@@ -222,6 +235,48 @@ public final class IndexTTS2Package: ModelPackage {
         return TTSResponse(audio: Audio(format: .wav, data: wav, sampleRate: IndexTTS2Generator.outputSampleRate, channels: 1))
     }
 
+    // MARK: - E12 typed plane (contract 1.38.0) → preset weights
+
+    /// The typed `TTSRequest.emotion` wins; `metaData["emotion"]` is the compatibility path.
+    /// `.categorical` resolves through the shared E12 vocabulary (canonical names + the 9→8
+    /// aliases) onto ONE preset at weight 1 × alpha; `.vector` is the 8-number head in
+    /// `EmotionPresets.categories` order, clamped and alpha-scaled exactly like the metaData array
+    /// form. `.referenceAudio` / `.textDescription` are NOT declared — the port has no
+    /// emo-audio-prompt / emo-text path yet — so the engine refuses them before admission, and a
+    /// direct caller is refused here, legibly, never silently.
+    nonisolated static func resolveEmotionWeights(typed: TTSEmotion?, meta: MetaValue?,
+                                                  alpha: Double) throws -> [Float]? {
+        guard let typed else { return try parseEmotion(meta, alpha: alpha) }
+        let scale = Float(max(0.0, min(1.0, alpha)))
+        var weights = [Float](repeating: 0, count: EmotionPresets.categories.count)
+        switch typed {
+        case .categorical(let label):
+            guard let emotion = E12Emotion.resolve(label) else {
+                throw PackageError.unsupportedRequestFeature(
+                    "emotion '\(label)' — known: \(E12Emotion.knownLabels)")
+            }
+            weights[emotion.presetIndex] = 1.0
+        case .vector(let values):
+            guard values.count == weights.count else {
+                throw PackageError.unsupportedRequestFeature(
+                    "emotion vector — want \(weights.count) weights in order "
+                        + "(\(EmotionPresets.categories.joined(separator: ", "))), got \(values.count)")
+            }
+            for (index, v) in values.enumerated() { weights[index] = max(0, min(1.2, v)) }
+        case .referenceAudio:
+            throw PackageError.unsupportedRequestFeature(
+                "emotion.referenceAudio — not in this port (upstream emo_audio_prompt); "
+                    + "send .categorical or .vector")
+        case .textDescription:
+            throw PackageError.unsupportedRequestFeature(
+                "emotion.textDescription — not in this port (upstream use_emo_text); "
+                    + "send .categorical or .vector")
+        @unknown default:
+            throw PackageError.unsupportedRequestFeature("emotion — mode not known to this package")
+        }
+        return weights.map { $0 * scale }
+    }
+
     // MARK: - E12 emotion parsing (`parse_emotion` + emo_alpha pre-scale)
 
     /// `emotion` accepts a preset name ("happy"), a weighted list ("happy:0.8,calm:0.2"),
@@ -237,9 +292,9 @@ public final class IndexTTS2Package: ModelPackage {
             for part in spec.split(separator: ",") {
                 let pair = part.split(separator: ":", maxSplits: 1)
                 let name = pair[0].trimmingCharacters(in: .whitespaces).lowercased()
-                guard let index = EmotionPresets.categories.firstIndex(of: name) else {
+                guard let index = E12Emotion.resolve(name)?.presetIndex else {
                     throw PackageError.unsupportedRequestFeature(
-                        "emotion '\(name)' — known: \(EmotionPresets.categories.joined(separator: ", "))")
+                        "emotion '\(name)' — known: \(E12Emotion.knownLabels)")
                 }
                 let weight = pair.count == 2 ? Float(pair[1].trimmingCharacters(in: .whitespaces)) ?? 1.0 : 1.0
                 weights[index] = max(0, min(1.2, weight))
@@ -290,4 +345,10 @@ extension MetaData {
         default: return nil
         }
     }
+}
+
+extension E12Emotion {
+    /// Position in `EmotionPresets.categories` (the weight-vector order). The two lists are the
+    /// same eight names in the same order — `ManifestTests` pins that, so this cannot drift.
+    var presetIndex: Int { EmotionPresets.categories.firstIndex(of: rawValue)! }
 }

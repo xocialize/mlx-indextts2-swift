@@ -31,7 +31,8 @@ let package = Package(
         .package(url: "https://github.com/xocialize/mlx-audio-dsp.git", from: "0.1.0"),
         // Engine contract — ≥0.51.0 for SPDXLicense.bilibiliModelUse (the IndexTTS-2.5
         // weight license, allowlisted); the engine executes materialization (≥0.32.0).
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.51.0"),
+        // 0.54.0 ⊇ contract 1.38.0: the E12 controls plane (TTSControls + typed emotion/targetDuration).
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.54.0"),
     ],
     targets: [
         .target(

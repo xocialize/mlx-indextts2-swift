@@ -67,15 +67,26 @@ try await engine.prepare(id)                        // materializes ~4.4 GB on f
 let request = TTSRequest(
     text: "The afternoon light settles quietly on the river.",
     voice: VoiceSelector(.referenceAudio(Audio(format: .wav, data: clip))),
-    metaData: ["language": .string("en"), "emotion": .string("happy"), "emoAlpha": .double(0.6),
-               "speechRate": .double(1.1), "seed": .int(42)])
+    emotion: .categorical("happy"),          // E12 typed plane (contract 1.38.0, engine ≥ 0.52.0)
+    targetDuration: 4.0,                     // native fit-to-cue; wins over speechRate
+    metaData: ["language": .string("en"), "emoAlpha": .double(0.6), "seed": .int(42)])
 let audio = (try await engine.run(request, package: id) as! TTSResponse).audio   // .wav 22.05 kHz
 ```
 
+**E12 controls** (contract 1.38.0; declared on the descriptor as
+`TTSControls(emotionModes: [.categorical, .vector], supportsTargetDuration: true)`, so the engine
+admits exactly these and refuses the rest before admission): `emotion` — `.categorical` over the
+fleet's shared vocabulary (`happy, angry, sad, afraid, disgusted, melancholic, surprised, calm`, plus
+the emotion2vec aliases `fearful → afraid` and `neutral` / `other` / `unknown` → `calm`) or `.vector`
+(8 weights in that order, clamped to 0…1.2); `targetDuration` (seconds). The typed fields win over
+the `metaData` strings below, which remain the compatibility path. `.referenceAudio` and
+`.textDescription` emotion are **not in this port** (upstream `emo_audio_prompt` / `use_emo_text`).
+
 `metaData` (C5): `language` (zh | en | ja | es | ar or a common name; omit to detect from script —
 Latin defaults to English, pass `es` for Spanish), `emotion` (preset name, `"happy:0.8,calm:0.2"`,
-or an 8-number array), `emoAlpha` (0.6), `targetDuration` (seconds, wins over rate), `speechRate`
-(1.0; = 1 / duration_factor), `seed`. Voice: `.referenceAudio` only.
+or an 8-number array — the compat path; names resolve through the same vocabulary), `emoAlpha`
+(0.6 — the intensity pre-scale for BOTH paths), `targetDuration` (compat path), `speechRate`
+(1.0; = 1 / duration_factor; `targetDuration` wins), `seed`. Voice: `.referenceAudio` only.
 
 Quant tiers (`IndexTTS2Configuration(quant:)`): `.fp16` as shipped, `.int8` / `.int4` quantize the
 GPT backbone in memory at load (same weight sources). `BudgetAware`: a tight engine budget drops

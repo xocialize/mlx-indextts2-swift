@@ -70,4 +70,65 @@ final class ManifestTests: XCTestCase {
         XCTAssertNil(try? IndexTTS2Package.parseEmotion(.bool(true), alpha: 0.6))
         XCTAssertNoThrow(try IndexTTS2Package.parseEmotion(nil, alpha: 0.6))
     }
+
+    // MARK: - E12 typed plane (contract 1.38.0, AB-A-0049 part 3)
+
+    func testDeclaresTheE12ControlsItActuallyImplements() {
+        let controls = manifest.surfaces[0].ttsControls
+        XCTAssertEqual(controls?.emotionModes, [.categorical, .vector])
+        XCTAssertEqual(controls?.supportsTargetDuration, true)
+        // Declaration derives advertisement (engine 1.38.0): both knobs advertised, nothing else.
+        XCTAssertTrue(manifest.surfaces[0].parameters.contains { $0.name == "emotion" })
+        XCTAssertTrue(manifest.surfaces[0].parameters.contains { $0.name == "targetDuration" })
+        XCTAssertTrue(manifest.surfaces[0].controlsMatchCapability)
+    }
+
+    func testSharedVocabularyIsThePresetOrder() {
+        // Every canonical name sits in `EmotionPresets.categories` at its own position — the
+        // weight-vector order — proven through `presetIndex` (which looks the name up there).
+        XCTAssertEqual(E12Emotion.allCases.map(\.presetIndex), Array(0 ..< 8))
+        XCTAssertEqual(E12Emotion.allCases.map(\.rawValue),
+                       ["happy", "angry", "sad", "afraid", "disgusted", "melancholic", "surprised", "calm"])
+        XCTAssertEqual(E12Emotion.resolve(" Fearful "), .afraid)
+        XCTAssertEqual(E12Emotion.resolve("neutral"), .calm)
+        XCTAssertEqual(E12Emotion.resolve("other"), .calm)
+        XCTAssertEqual(E12Emotion.resolve("unknown"), .calm)
+        XCTAssertNil(E12Emotion.resolve("ecstatic"))
+    }
+
+    func testTypedCategoricalLandsOnTheSamePresetAsTheMetaDataString() throws {
+        let typed = try IndexTTS2Package.resolveEmotionWeights(
+            typed: .categorical("happy"), meta: nil, alpha: 0.6)
+        let meta = try IndexTTS2Package.parseEmotion(.string("happy"), alpha: 0.6)
+        XCTAssertEqual(typed, meta)
+        XCTAssertEqual(typed?[0], 0.6)
+        // An alias from the emotion2vec set resolves on BOTH paths.
+        XCTAssertEqual(try IndexTTS2Package.resolveEmotionWeights(typed: .categorical("fearful"), meta: nil, alpha: 1.0)?[3], 1.0)
+        XCTAssertEqual(try IndexTTS2Package.parseEmotion(.string("neutral"), alpha: 1.0)?[7], 1.0)
+    }
+
+    func testTypedVectorMatchesTheMetaDataArrayForm() throws {
+        let typed = try IndexTTS2Package.resolveEmotionWeights(
+            typed: .vector([0.5, 0, 0, 0, 0, 0, 0, 0.5]), meta: nil, alpha: 1.0)
+        let meta = try IndexTTS2Package.parseEmotion(
+            .array([.double(0.5), .int(0), .double(0), .double(0), .double(0), .double(0), .double(0), .double(0.5)]),
+            alpha: 1.0)
+        XCTAssertEqual(typed, meta)
+        XCTAssertNil(try? IndexTTS2Package.resolveEmotionWeights(typed: .vector([1]), meta: nil, alpha: 1.0))
+    }
+
+    func testTypedWinsOverMetaDataAndUndeclaredModesAreRefused() throws {
+        let both = try IndexTTS2Package.resolveEmotionWeights(
+            typed: .categorical("sad"), meta: .string("happy"), alpha: 1.0)
+        XCTAssertEqual(both?[2], 1.0)   // sad
+        XCTAssertEqual(both?[0], 0.0)   // not happy
+        XCTAssertNil(try? IndexTTS2Package.resolveEmotionWeights(
+            typed: .textDescription("sound tired"), meta: nil, alpha: 1.0))
+        XCTAssertNil(try? IndexTTS2Package.resolveEmotionWeights(
+            typed: .referenceAudio(Audio(data: Data())), meta: nil, alpha: 1.0))
+        XCTAssertNil(try? IndexTTS2Package.resolveEmotionWeights(
+            typed: .categorical("ecstatic"), meta: nil, alpha: 1.0))
+        // No typed value: the metaData path, unchanged.
+        XCTAssertNil(try IndexTTS2Package.resolveEmotionWeights(typed: nil, meta: nil, alpha: 1.0))
+    }
 }
