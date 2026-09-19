@@ -20,6 +20,12 @@ import MLXIndexTTS2TTS
 import MLXServeCore
 import MLXToolKit
 
+// AB-T-0133: line-buffer stdout even when it is a file or a pipe. Swift's `print` goes through C
+// stdio, which block-buffers a non-tty — so a gate run captured to a log showed NOTHING for the whole
+// materialization: its "registered / needsDownload" lines sat in a 4 KB buffer while a healthy 4.5 GB
+// download ran, and the run read as a 12-minute hang. Liveness must be visible where the log is.
+setvbuf(stdout, nil, _IOLBF, 0)
+
 // MARK: - Plumbing
 
 func fail(_ message: String) -> Never {
@@ -384,7 +390,37 @@ func gateEngine() async throws {
     guard advisories.isEmpty else { fail("license advisory raised — the weights are not admitted cleanly: \(advisories)") }
     let needs = await engine.needsDownload(.tts, package: id)
     print("  needsDownload=\(needs) (store \(store.path))")
+    // AB-T-0133: narrate prepare() from the engine's own phase monitor (`engine.preparation`, the seam
+    // ML[X] Audio Studio's UI binds to). Before this the gate was SILENT for the whole materialization,
+    // and a healthy multi-GB download read as a hang: `lsof -i` shows no sockets because
+    // Network.framework moves the bytes over user-space channels lsof cannot enumerate, and a slow
+    // link leaves the process at ~0 CPU. The store's byte growth and this phase line are the liveness
+    // signals — not sockets, not CPU.
+    let narrator = Task {
+        var lastLine = ""; var lastPrint = Date.distantPast
+        while !Task.isCancelled {
+            let phase = await engine.preparation.phase(for: .tts, package: id.rawValue)
+            var line = ""
+            switch phase {
+            case .downloading(let fraction, let bps):
+                let pct = Int(fraction * 100)
+                let speed = bps.map { String(format: " · %.1f MB/s", $0 / 1_000_000) } ?? ""
+                line = "  [prepare] downloading \(pct - pct % 5)%\(speed)"
+            case .prewarming(let fraction): line = "  [prepare] prewarming \(Int(fraction * 100))%"
+            case .loading: line = "  [prepare] loading"
+            case .registering: line = "  [prepare] registering"
+            case .idle, .ready, .failed: break
+            }
+            let bucketChanged = line.prefix(while: { $0 != "·" }) != lastLine.prefix(while: { $0 != "·" })
+            if !line.isEmpty, bucketChanged || Date().timeIntervalSince(lastPrint) >= 10 {
+                print(line); lastLine = line; lastPrint = Date()
+            }
+            try? await Task.sleep(for: .seconds(2))
+        }
+    }
+    defer { narrator.cancel() }
     try await engine.prepare(.tts, package: id)
+    narrator.cancel()
     print(String(format: "  prepared in %.1fs (download + load)", Date().timeIntervalSince(t0)))
 
     @discardableResult
